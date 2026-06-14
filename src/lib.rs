@@ -5,7 +5,7 @@ mod pyo3_pipe {
     use pyo3::types::{PyDict, PyList};
     use std::{collections::HashMap, env, ffi::OsString, path::PathBuf, sync::Arc};
 
-    pub const DEFAULT_PYTHON_MODULE: &str = "ferrous_framework.pipe";
+    pub const DEFAULT_PYTHON_MODULE: &str = "framework_shells.ferrous_framework";
     pub const DEFAULT_PYTHON_CLASS: &str = "FerrousFrameworkPipe";
 
     #[derive(Clone, Debug)]
@@ -124,7 +124,7 @@ mod pyo3_pipe {
     use anyhow::{Result, bail};
     use std::{collections::HashMap, path::PathBuf};
 
-    pub const DEFAULT_PYTHON_MODULE: &str = "ferrous_framework.pipe";
+    pub const DEFAULT_PYTHON_MODULE: &str = "framework_shells.ferrous_framework";
     pub const DEFAULT_PYTHON_CLASS: &str = "FerrousFrameworkPipe";
 
     #[derive(Clone, Debug)]
