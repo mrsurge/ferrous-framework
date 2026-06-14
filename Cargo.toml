@@ -5,7 +5,7 @@ edition = "2024"
 license = "MIT"
 repository = "https://github.com/mrsurge/ferrous-framework"
 rust-version = "1.93"
-description = "Rust adapter for framework-shells native pipe processes"
+description = "Rust adapter and runtime path for framework-shells-compatible process management"
 
 [features]
 default = []
