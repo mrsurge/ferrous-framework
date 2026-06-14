@@ -1,5 +1,5 @@
 #[cfg(feature = "pyo3-embed")]
-mod pyo3_pipe {
+mod pyo3_bridge {
     use anyhow::{Context, Result, anyhow};
     use pyo3::prelude::*;
     use pyo3::types::{PyDict, PyList};
@@ -7,6 +7,24 @@ mod pyo3_pipe {
 
     pub const DEFAULT_PYTHON_MODULE: &str = "framework_shells.ferrous_framework";
     pub const DEFAULT_PYTHON_CLASS: &str = "FerrousFrameworkPipe";
+
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub enum FerrousBackend {
+        #[default]
+        Pipe,
+        Pty,
+        Proc,
+    }
+
+    impl FerrousBackend {
+        pub const fn as_str(self) -> &'static str {
+            match self {
+                Self::Pipe => "pipe",
+                Self::Pty => "pty",
+                Self::Proc => "proc",
+            }
+        }
+    }
 
     #[derive(Clone, Debug)]
     pub struct FerrousPipeConfig {
@@ -22,13 +40,46 @@ mod pyo3_pipe {
         pub python_class: Option<String>,
     }
 
+    #[derive(Clone, Debug)]
+    pub struct FerrousShellConfig {
+        pub backend: FerrousBackend,
+        pub command: Vec<String>,
+        pub cwd: Option<PathBuf>,
+        pub env: HashMap<String, String>,
+        pub label: String,
+        pub spec_id: String,
+        pub subgroups: Vec<String>,
+        pub shellspec_path: Option<PathBuf>,
+        pub shellspec_entry: Option<String>,
+        pub python_module: Option<String>,
+        pub python_class: Option<String>,
+    }
+
+    impl From<FerrousPipeConfig> for FerrousShellConfig {
+        fn from(config: FerrousPipeConfig) -> Self {
+            Self {
+                backend: FerrousBackend::Pipe,
+                command: config.command,
+                cwd: config.cwd,
+                env: config.env,
+                label: config.label,
+                spec_id: config.spec_id,
+                subgroups: config.subgroups,
+                shellspec_path: config.shellspec_path,
+                shellspec_entry: config.shellspec_entry,
+                python_module: config.python_module,
+                python_class: config.python_class,
+            }
+        }
+    }
+
     #[derive(Clone)]
-    pub struct FerrousFrameworkPipe {
+    pub struct FerrousFrameworkShell {
         inner: Arc<Py<PyAny>>,
     }
 
-    impl FerrousFrameworkPipe {
-        pub fn spawn(config: FerrousPipeConfig) -> Result<Self> {
+    impl FerrousFrameworkShell {
+        pub fn spawn(config: FerrousShellConfig) -> Result<Self> {
             let pythonpath = config.env.get("PYTHONPATH").map(OsString::from);
             let python_module = config
                 .python_module
@@ -68,6 +119,7 @@ mod pyo3_pipe {
                     .as_ref()
                     .map(|path| path.to_string_lossy().into_owned());
                 let shellspec_entry = config.shellspec_entry.as_deref();
+                let backend = config.backend.as_str();
                 let object = cls.call1((
                     command,
                     cwd,
@@ -77,12 +129,13 @@ mod pyo3_pipe {
                     subgroups,
                     shellspec_path,
                     shellspec_entry,
+                    backend,
                 ))?;
                 Ok(Self {
                     inner: Arc::new(object.into()),
                 })
             })
-            .map_err(|err| anyhow!("failed to start ferrous_framework pipe: {err}"))
+            .map_err(|err| anyhow!("failed to start ferrous_framework shell: {err}"))
         }
 
         pub fn write_line_blocking(&self, line: &str) -> Result<()> {
@@ -90,7 +143,7 @@ mod pyo3_pipe {
                 self.inner.call_method1(py, "write_line", (line,))?;
                 Ok(())
             })
-            .map_err(|err| anyhow!("ferrous_framework pipe write failed: {err}"))
+            .map_err(|err| anyhow!("ferrous_framework shell write failed: {err}"))
         }
 
         pub fn read_line_blocking(&self) -> Result<Option<String>> {
@@ -99,7 +152,7 @@ mod pyo3_pipe {
                     .call_method1(py, "read_line", (None::<f64>,))?
                     .extract(py)
             })
-            .map_err(|err| anyhow!("ferrous_framework pipe read failed: {err}"))
+            .map_err(|err| anyhow!("ferrous_framework shell read failed: {err}"))
         }
 
         pub fn shell_id(&self) -> Result<String> {
@@ -114,18 +167,65 @@ mod pyo3_pipe {
                 self.inner.call_method0(py, "close")?;
                 Ok(())
             })
-            .map_err(|err| anyhow!("ferrous_framework pipe close failed: {err}"))
+            .map_err(|err| anyhow!("ferrous_framework shell close failed: {err}"))
+        }
+    }
+
+    #[derive(Clone)]
+    pub struct FerrousFrameworkPipe {
+        inner: FerrousFrameworkShell,
+    }
+
+    impl FerrousFrameworkPipe {
+        pub fn spawn(config: FerrousPipeConfig) -> Result<Self> {
+            Ok(Self {
+                inner: FerrousFrameworkShell::spawn(config.into())?,
+            })
+        }
+
+        pub fn write_line_blocking(&self, line: &str) -> Result<()> {
+            self.inner.write_line_blocking(line)
+        }
+
+        pub fn read_line_blocking(&self) -> Result<Option<String>> {
+            self.inner.read_line_blocking()
+        }
+
+        pub fn shell_id(&self) -> Result<String> {
+            self.inner.shell_id()
+        }
+
+        pub fn close_blocking(&self) -> Result<()> {
+            self.inner.close_blocking()
         }
     }
 }
 
 #[cfg(not(feature = "pyo3-embed"))]
-mod pyo3_pipe {
+mod pyo3_bridge {
     use anyhow::{Result, bail};
     use std::{collections::HashMap, path::PathBuf};
 
     pub const DEFAULT_PYTHON_MODULE: &str = "framework_shells.ferrous_framework";
     pub const DEFAULT_PYTHON_CLASS: &str = "FerrousFrameworkPipe";
+
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub enum FerrousBackend {
+        #[default]
+        Pipe,
+        Pty,
+        Proc,
+    }
+
+    impl FerrousBackend {
+        pub const fn as_str(self) -> &'static str {
+            match self {
+                Self::Pipe => "pipe",
+                Self::Pty => "pty",
+                Self::Proc => "proc",
+            }
+        }
+    }
 
     #[derive(Clone, Debug)]
     pub struct FerrousPipeConfig {
@@ -139,6 +239,64 @@ mod pyo3_pipe {
         pub shellspec_entry: Option<String>,
         pub python_module: Option<String>,
         pub python_class: Option<String>,
+    }
+
+    #[derive(Clone, Debug)]
+    pub struct FerrousShellConfig {
+        pub backend: FerrousBackend,
+        pub command: Vec<String>,
+        pub cwd: Option<PathBuf>,
+        pub env: HashMap<String, String>,
+        pub label: String,
+        pub spec_id: String,
+        pub subgroups: Vec<String>,
+        pub shellspec_path: Option<PathBuf>,
+        pub shellspec_entry: Option<String>,
+        pub python_module: Option<String>,
+        pub python_class: Option<String>,
+    }
+
+    impl From<FerrousPipeConfig> for FerrousShellConfig {
+        fn from(config: FerrousPipeConfig) -> Self {
+            Self {
+                backend: FerrousBackend::Pipe,
+                command: config.command,
+                cwd: config.cwd,
+                env: config.env,
+                label: config.label,
+                spec_id: config.spec_id,
+                subgroups: config.subgroups,
+                shellspec_path: config.shellspec_path,
+                shellspec_entry: config.shellspec_entry,
+                python_module: config.python_module,
+                python_class: config.python_class,
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    pub struct FerrousFrameworkShell;
+
+    impl FerrousFrameworkShell {
+        pub fn spawn(_config: FerrousShellConfig) -> Result<Self> {
+            bail!("ferrous_framework was built without the pyo3-embed feature")
+        }
+
+        pub fn write_line_blocking(&self, _line: &str) -> Result<()> {
+            bail!("ferrous_framework was built without the pyo3-embed feature")
+        }
+
+        pub fn read_line_blocking(&self) -> Result<Option<String>> {
+            bail!("ferrous_framework was built without the pyo3-embed feature")
+        }
+
+        pub fn shell_id(&self) -> Result<String> {
+            bail!("ferrous_framework was built without the pyo3-embed feature")
+        }
+
+        pub fn close_blocking(&self) -> Result<()> {
+            bail!("ferrous_framework was built without the pyo3-embed feature")
+        }
     }
 
     #[derive(Clone)]
@@ -167,8 +325,9 @@ mod pyo3_pipe {
     }
 }
 
-pub use pyo3_pipe::{
-    DEFAULT_PYTHON_CLASS, DEFAULT_PYTHON_MODULE, FerrousFrameworkPipe, FerrousPipeConfig,
+pub use pyo3_bridge::{
+    DEFAULT_PYTHON_CLASS, DEFAULT_PYTHON_MODULE, FerrousBackend, FerrousFrameworkPipe,
+    FerrousFrameworkShell, FerrousPipeConfig, FerrousShellConfig,
 };
 
 pub const fn pyo3_embed_enabled() -> bool {
