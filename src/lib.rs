@@ -7,6 +7,7 @@ mod pyo3_bridge {
 
     pub const DEFAULT_PYTHON_MODULE: &str = "framework_shells.ferrous_framework";
     pub const DEFAULT_PYTHON_CLASS: &str = "FerrousFrameworkPipe";
+    pub const DEFAULT_PYTHON_HOST_CLASS: &str = "FerrousFrameworkHost";
 
     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
     pub enum FerrousBackend {
@@ -49,6 +50,7 @@ mod pyo3_bridge {
         pub label: String,
         pub spec_id: String,
         pub subgroups: Vec<String>,
+        pub ctx: HashMap<String, String>,
         pub shellspec_path: Option<PathBuf>,
         pub shellspec_entry: Option<String>,
         pub python_module: Option<String>,
@@ -65,11 +67,110 @@ mod pyo3_bridge {
                 label: config.label,
                 spec_id: config.spec_id,
                 subgroups: config.subgroups,
+                ctx: HashMap::new(),
                 shellspec_path: config.shellspec_path,
                 shellspec_entry: config.shellspec_entry,
                 python_module: config.python_module,
                 python_class: config.python_class,
             }
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    pub struct FerrousHostConfig {
+        pub host: String,
+        pub port: u16,
+        pub env: HashMap<String, String>,
+        pub run_id: Option<String>,
+        pub python_module: Option<String>,
+        pub python_class: Option<String>,
+    }
+
+    impl Default for FerrousHostConfig {
+        fn default() -> Self {
+            Self {
+                host: "127.0.0.1".to_owned(),
+                port: 0,
+                env: HashMap::new(),
+                run_id: None,
+                python_module: None,
+                python_class: None,
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    pub struct FerrousFrameworkHost {
+        inner: Arc<Py<PyAny>>,
+    }
+
+    impl FerrousFrameworkHost {
+        pub fn spawn(config: FerrousHostConfig) -> Result<Self> {
+            let pythonpath = config.env.get("PYTHONPATH").map(OsString::from);
+            let python_module = config
+                .python_module
+                .as_deref()
+                .unwrap_or(DEFAULT_PYTHON_MODULE)
+                .to_owned();
+            let python_class = config
+                .python_class
+                .as_deref()
+                .unwrap_or(DEFAULT_PYTHON_HOST_CLASS)
+                .to_owned();
+            Python::initialize();
+            Python::attach(|py| -> PyResult<Self> {
+                if let Some(pythonpath) = pythonpath {
+                    let sys = py.import("sys")?;
+                    let sys_path = sys.getattr("path")?;
+                    let paths: Vec<_> = env::split_paths(&pythonpath).collect();
+                    for path in paths.into_iter().rev() {
+                        sys_path
+                            .call_method1("insert", (0, path.to_string_lossy().into_owned()))?;
+                    }
+                }
+                let module = py.import(python_module.as_str())?;
+                let cls = module.getattr(python_class.as_str())?;
+                let env = PyDict::new(py);
+                for (key, value) in config.env {
+                    env.set_item(key, value)?;
+                }
+                let object =
+                    cls.call1((config.host, config.port, env, config.run_id.as_deref()))?;
+                Ok(Self {
+                    inner: Arc::new(object.into()),
+                })
+            })
+            .map_err(|err| anyhow!("failed to start ferrous_framework host: {err}"))
+        }
+
+        pub fn url(&self) -> Result<String> {
+            Python::attach(|py| -> PyResult<String> {
+                self.inner.call_method0(py, "url")?.extract(py)
+            })
+            .context("failed to read ferrous_framework host url")
+        }
+
+        pub fn port(&self) -> Result<u16> {
+            let port = Python::attach(|py| -> PyResult<u16> {
+                self.inner.call_method0(py, "port")?.extract(py)
+            })
+            .context("failed to read ferrous_framework host port")?;
+            Ok(port)
+        }
+
+        pub fn child_env(&self) -> Result<HashMap<String, String>> {
+            Python::attach(|py| -> PyResult<HashMap<String, String>> {
+                self.inner.call_method0(py, "child_env")?.extract(py)
+            })
+            .context("failed to read ferrous_framework host child env")
+        }
+
+        pub fn close_blocking(&self) -> Result<()> {
+            Python::attach(|py| -> PyResult<()> {
+                self.inner.call_method0(py, "close")?;
+                Ok(())
+            })
+            .map_err(|err| anyhow!("ferrous_framework host close failed: {err}"))
         }
     }
 
@@ -109,6 +210,10 @@ mod pyo3_bridge {
                 for (key, value) in config.env {
                     env.set_item(key, value)?;
                 }
+                let ctx = PyDict::new(py);
+                for (key, value) in config.ctx {
+                    ctx.set_item(key, value)?;
+                }
                 let subgroups = PyList::new(py, &config.subgroups)?;
                 let cwd = config
                     .cwd
@@ -130,6 +235,7 @@ mod pyo3_bridge {
                     shellspec_path,
                     shellspec_entry,
                     backend,
+                    ctx,
                 ))?;
                 Ok(Self {
                     inner: Arc::new(object.into()),
@@ -208,6 +314,7 @@ mod pyo3_bridge {
 
     pub const DEFAULT_PYTHON_MODULE: &str = "framework_shells.ferrous_framework";
     pub const DEFAULT_PYTHON_CLASS: &str = "FerrousFrameworkPipe";
+    pub const DEFAULT_PYTHON_HOST_CLASS: &str = "FerrousFrameworkHost";
 
     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
     pub enum FerrousBackend {
@@ -250,6 +357,7 @@ mod pyo3_bridge {
         pub label: String,
         pub spec_id: String,
         pub subgroups: Vec<String>,
+        pub ctx: HashMap<String, String>,
         pub shellspec_path: Option<PathBuf>,
         pub shellspec_entry: Option<String>,
         pub python_module: Option<String>,
@@ -266,11 +374,60 @@ mod pyo3_bridge {
                 label: config.label,
                 spec_id: config.spec_id,
                 subgroups: config.subgroups,
+                ctx: HashMap::new(),
                 shellspec_path: config.shellspec_path,
                 shellspec_entry: config.shellspec_entry,
                 python_module: config.python_module,
                 python_class: config.python_class,
             }
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    pub struct FerrousHostConfig {
+        pub host: String,
+        pub port: u16,
+        pub env: HashMap<String, String>,
+        pub run_id: Option<String>,
+        pub python_module: Option<String>,
+        pub python_class: Option<String>,
+    }
+
+    impl Default for FerrousHostConfig {
+        fn default() -> Self {
+            Self {
+                host: "127.0.0.1".to_owned(),
+                port: 0,
+                env: HashMap::new(),
+                run_id: None,
+                python_module: None,
+                python_class: None,
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    pub struct FerrousFrameworkHost;
+
+    impl FerrousFrameworkHost {
+        pub fn spawn(_config: FerrousHostConfig) -> Result<Self> {
+            bail!("ferrous_framework was built without the pyo3-embed feature")
+        }
+
+        pub fn url(&self) -> Result<String> {
+            bail!("ferrous_framework was built without the pyo3-embed feature")
+        }
+
+        pub fn port(&self) -> Result<u16> {
+            bail!("ferrous_framework was built without the pyo3-embed feature")
+        }
+
+        pub fn child_env(&self) -> Result<HashMap<String, String>> {
+            bail!("ferrous_framework was built without the pyo3-embed feature")
+        }
+
+        pub fn close_blocking(&self) -> Result<()> {
+            bail!("ferrous_framework was built without the pyo3-embed feature")
         }
     }
 
@@ -326,8 +483,9 @@ mod pyo3_bridge {
 }
 
 pub use pyo3_bridge::{
-    DEFAULT_PYTHON_CLASS, DEFAULT_PYTHON_MODULE, FerrousBackend, FerrousFrameworkPipe,
-    FerrousFrameworkShell, FerrousPipeConfig, FerrousShellConfig,
+    DEFAULT_PYTHON_CLASS, DEFAULT_PYTHON_HOST_CLASS, DEFAULT_PYTHON_MODULE, FerrousBackend,
+    FerrousFrameworkHost, FerrousFrameworkPipe, FerrousFrameworkShell, FerrousHostConfig,
+    FerrousPipeConfig, FerrousShellConfig,
 };
 
 pub const fn pyo3_embed_enabled() -> bool {

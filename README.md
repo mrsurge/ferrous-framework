@@ -22,13 +22,15 @@ The bridge imports this Python module by default:
 framework_shells.ferrous_framework
 ```
 
-That module is provided by `framework-shells >= 0.0.55`.
+That module is provided by `framework-shells >= 0.0.56`.
 
 ## Public API
 
 Generic API:
 
 - `FerrousBackend`
+- `FerrousHostConfig`
+- `FerrousFrameworkHost`
 - `FerrousShellConfig`
 - `FerrousFrameworkShell`
 
@@ -55,7 +57,21 @@ Current implementation is still bridge-backed. Backend behavior is provided by t
 
 Shellspec compatibility is a core requirement. A compiled Rust framework should be able to change runtime parameters without rebuilding the binary.
 
-The current bridge carries shellspec path and entry information through to Python FWS. Future Rust-native work should preserve shellspec behavior and eventually add Rust-side parsing/rendering parity.
+The current bridge carries shellspec path, entry, and render context information through to Python FWS. Future Rust-native work should preserve shellspec behavior and eventually add Rust-side parsing/rendering parity.
+
+## Host Runtime
+
+`FerrousFrameworkHost` starts the current bridge-backed FWS dashboard and Socket.IO root for Rust programs that are the FWS initializer. It binds `host:port`, supports `port: 0` for free-port parity, and returns child environment values that should be inherited by managed workers.
+
+```rust
+use ferrous_framework::{FerrousFrameworkHost, FerrousHostConfig};
+
+let host = FerrousFrameworkHost::spawn(FerrousHostConfig::default())?;
+let fws_url = host.url()?;
+let child_env = host.child_env()?;
+```
+
+The current host implementation enters Python once and mounts the existing FWS FastAPI/Socket.IO runtime. Future Rust-native work should keep this public shape while replacing the internals with a Rust-owned host.
 
 ## Feature Flags
 
@@ -83,6 +99,7 @@ let shell = FerrousFrameworkShell::spawn(FerrousShellConfig {
     label: "my-worker".into(),
     spec_id: "my-worker".into(),
     subgroups: vec!["my-app".into(), "jsonrpc".into()],
+    ctx: HashMap::new(),
     shellspec_path: None,
     shellspec_entry: None,
     python_module: None,
@@ -96,7 +113,7 @@ let response = shell.read_line_blocking()?;
 ## Compatibility Notes
 
 - `FerrousFrameworkPipe` remains available as a compatibility wrapper around `FerrousFrameworkShell` with `FerrousBackend::Pipe`.
-- The crate expects the Python environment to have `framework-shells >= 0.0.55` when `pyo3-embed` is used.
+- The crate expects the Python environment to have `framework-shells >= 0.0.56` when `pyo3-embed` is used.
 - ALS-RS is a pipe compatibility consumer, not the full target architecture.
 - TE2-style framework runtimes are the broader compatibility canary for future Rust-owned FWS behavior.
 
