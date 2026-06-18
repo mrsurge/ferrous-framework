@@ -24,6 +24,41 @@ framework_shells.ferrous_framework
 
 That module is provided by `framework-shells >= 0.0.57`.
 
+## Native Proc Baseline
+
+The first Rust-owned runtime slice is `FerrousNativeManager` with `proc` support:
+
+```rust
+use ferrous_framework::{
+    FerrousNativeManager, FerrousNativeProcConfig,
+};
+
+let manager = FerrousNativeManager::new();
+let record = manager.spawn_proc_blocking(FerrousNativeProcConfig {
+    command: vec!["sh".into(), "-c".into(), "echo hello".into()],
+    cwd: None,
+    env: Default::default(),
+    label: "worker".into(),
+    spec_id: "worker".into(),
+    subgroups: vec!["demo".into()],
+    log_dir: "target/fws-logs".into(),
+})?;
+let exited = manager.wait_shell_blocking(
+    &record.id,
+    std::time::Duration::from_secs(5),
+)?;
+```
+
+This path is fully Rust-owned: it launches the process, records shell metadata, captures stdout/stderr to log files, lists/gets records, terminates running children, and observes exit status. It does not use Python or the PyO3 bridge.
+
+Current native backend coverage:
+
+```text
+proc: launch, logs, list/get, terminate, wait
+pipe: bridge-backed only
+pty: bridge-backed only
+```
+
 ## Public API
 
 Generic API:

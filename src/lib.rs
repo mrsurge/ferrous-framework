@@ -1,4 +1,5 @@
 pub mod bridge;
+pub mod native_proc;
 pub mod shellspec;
 pub mod shutdown;
 
@@ -569,6 +570,10 @@ mod pyo3_bridge {
     }
 }
 
+pub use native_proc::{
+    FerrousNativeManager, FerrousNativeProcConfig, FerrousNativeShellCapabilities,
+    FerrousNativeShellRecord, FerrousNativeShellStatus,
+};
 pub use pyo3_bridge::{
     DEFAULT_PYTHON_CLASS, DEFAULT_PYTHON_HOST_CLASS, DEFAULT_PYTHON_MODULE, FerrousBackend,
     FerrousFrameworkHost, FerrousFrameworkPipe, FerrousFrameworkShell, FerrousHostConfig,
