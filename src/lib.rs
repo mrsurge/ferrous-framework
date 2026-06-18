@@ -1,3 +1,5 @@
+pub mod shellspec;
+
 #[cfg(feature = "pyo3-embed")]
 mod pyo3_bridge {
     use anyhow::{Context, Result, anyhow};

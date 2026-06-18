@@ -125,3 +125,13 @@ let response = shell.read_line_blocking()?;
 - Add Rust-owned proc lifecycle/log runtime.
 - Add Rust shellspec parser/renderer parity.
 - Build toward a Rust FWS-compatible manager suite.
+
+## Parity Tests
+
+The crate carries shellspec-rendering parity fixtures under `testdata/`. Run them with:
+
+```sh
+cargo test
+```
+
+The current fixture set covers `proc`, `pipe`, and `pty` render surfaces, ctx/env precedence, missing values, and stable free-port substitution.
