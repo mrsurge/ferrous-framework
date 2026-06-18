@@ -22,7 +22,7 @@ The bridge imports this Python module by default:
 framework_shells.ferrous_framework
 ```
 
-That module is provided by `framework-shells >= 0.0.56`.
+That module is provided by `framework-shells >= 0.0.57`.
 
 ## Public API
 
@@ -73,6 +73,17 @@ let child_env = host.child_env()?;
 
 The current host implementation enters Python once and mounts the existing FWS FastAPI/Socket.IO runtime. Future Rust-native work should keep this public shape while replacing the internals with a Rust-owned host.
 
+When the PyO3 bridge path is used, Ferrous validates the installed Python bridge metadata before constructing a host or shell. Older or incompatible `framework_shells.ferrous_framework` installs fail fast instead of silently taking the wrong bridge path.
+
+The host also exposes shutdown management calls:
+
+```rust
+let group_result = host.shutdown_group_blocking("my-app")?;
+let tree_result = host.shutdown_tree_blocking(vec![1234])?;
+```
+
+Both calls delegate to the installed framework-shells shutdown implementation and return `FerrousShutdownResult`, including timing, root PIDs, stats, and collected shutdown events. They do not replace the FWS shutdown algorithm.
+
 ## Feature Flags
 
 By default, the crate builds without embedding Python and returns explicit errors from runtime calls.
@@ -113,7 +124,7 @@ let response = shell.read_line_blocking()?;
 ## Compatibility Notes
 
 - `FerrousFrameworkPipe` remains available as a compatibility wrapper around `FerrousFrameworkShell` with `FerrousBackend::Pipe`.
-- The crate expects the Python environment to have `framework-shells >= 0.0.56` when `pyo3-embed` is used.
+- The crate expects the Python environment to have `framework-shells >= 0.0.57` when `pyo3-embed` is used.
 - ALS-RS is a pipe compatibility consumer, not the full target architecture.
 - TE2-style framework runtimes are the broader compatibility canary for future Rust-owned FWS behavior.
 

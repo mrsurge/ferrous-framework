@@ -1,10 +1,15 @@
+pub mod bridge;
 pub mod shellspec;
+pub mod shutdown;
 
 #[cfg(feature = "pyo3-embed")]
 mod pyo3_bridge {
+    use crate::bridge::validate_bridge_info;
+    use crate::shutdown::{FerrousShutdownResult, parse_shutdown_result};
     use anyhow::{Context, Result, anyhow};
     use pyo3::prelude::*;
-    use pyo3::types::{PyDict, PyList};
+    use pyo3::types::{PyDict, PyList, PyString};
+    use serde_json::Value;
     use std::{collections::HashMap, env, ffi::OsString, path::PathBuf, sync::Arc};
 
     pub const DEFAULT_PYTHON_MODULE: &str = "framework_shells.ferrous_framework";
@@ -131,6 +136,7 @@ mod pyo3_bridge {
                     }
                 }
                 let module = py.import(python_module.as_str())?;
+                validate_python_bridge(py, &module)?;
                 let cls = module.getattr(python_class.as_str())?;
                 let env = PyDict::new(py);
                 for (key, value) in config.env {
@@ -174,6 +180,32 @@ mod pyo3_bridge {
             })
             .map_err(|err| anyhow!("ferrous_framework host close failed: {err}"))
         }
+
+        pub fn shutdown_group_blocking(&self, app_id: &str) -> Result<FerrousShutdownResult> {
+            Python::attach(|py| -> PyResult<FerrousShutdownResult> {
+                let result = self.inner.call_method1(py, "shutdown_group", (app_id,))?;
+                let value = py_any_to_json_value(py, result.bind(py))?;
+                parse_shutdown_result(&value).map_err(|err| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                        "ferrous_framework shutdown_group returned invalid result: {err}"
+                    ))
+                })
+            })
+            .map_err(|err| anyhow!("ferrous_framework host shutdown_group failed: {err}"))
+        }
+
+        pub fn shutdown_tree_blocking(&self, root_pids: Vec<i64>) -> Result<FerrousShutdownResult> {
+            Python::attach(|py| -> PyResult<FerrousShutdownResult> {
+                let result = self.inner.call_method1(py, "shutdown_tree", (root_pids,))?;
+                let value = py_any_to_json_value(py, result.bind(py))?;
+                parse_shutdown_result(&value).map_err(|err| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                        "ferrous_framework shutdown_tree returned invalid result: {err}"
+                    ))
+                })
+            })
+            .map_err(|err| anyhow!("ferrous_framework host shutdown_tree failed: {err}"))
+        }
     }
 
     #[derive(Clone)]
@@ -206,6 +238,7 @@ mod pyo3_bridge {
                     }
                 }
                 let module = py.import(python_module.as_str())?;
+                validate_python_bridge(py, &module)?;
                 let cls = module.getattr(python_class.as_str())?;
                 let command = PyList::new(py, &config.command)?;
                 let env = PyDict::new(py);
@@ -307,10 +340,51 @@ mod pyo3_bridge {
             self.inner.close_blocking()
         }
     }
+
+    fn validate_python_bridge(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
+        let info = module
+            .getattr("ferrous_bridge_info")
+            .and_then(|func| func.call0())
+            .map_err(|err| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                    "installed ferrous Python bridge does not expose ferrous_bridge_info(): {err}"
+                ))
+            })?;
+        let json = py.import("json")?;
+        let value = py_any_to_json_value_with_json(
+            &json,
+            &info,
+            "installed ferrous Python bridge returned invalid metadata",
+        )?;
+        validate_bridge_info(&value).map_err(|err| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                "installed ferrous Python bridge is incompatible: {err}"
+            ))
+        })?;
+        Ok(())
+    }
+
+    fn py_any_to_json_value(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Value> {
+        let json = py.import("json")?;
+        py_any_to_json_value_with_json(&json, value, "failed to convert Python object to JSON")
+    }
+
+    fn py_any_to_json_value_with_json(
+        json: &Bound<'_, PyModule>,
+        value: &Bound<'_, PyAny>,
+        context: &str,
+    ) -> PyResult<Value> {
+        let raw = json.call_method1("dumps", (value,))?;
+        let raw = raw.cast::<PyString>()?.to_str()?;
+        serde_json::from_str(raw).map_err(|err| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{context}: {err}"))
+        })
+    }
 }
 
 #[cfg(not(feature = "pyo3-embed"))]
 mod pyo3_bridge {
+    use crate::shutdown::FerrousShutdownResult;
     use anyhow::{Result, bail};
     use std::{collections::HashMap, path::PathBuf};
 
@@ -431,6 +505,17 @@ mod pyo3_bridge {
         pub fn close_blocking(&self) -> Result<()> {
             bail!("ferrous_framework was built without the pyo3-embed feature")
         }
+
+        pub fn shutdown_group_blocking(&self, _app_id: &str) -> Result<FerrousShutdownResult> {
+            bail!("ferrous_framework was built without the pyo3-embed feature")
+        }
+
+        pub fn shutdown_tree_blocking(
+            &self,
+            _root_pids: Vec<i64>,
+        ) -> Result<FerrousShutdownResult> {
+            bail!("ferrous_framework was built without the pyo3-embed feature")
+        }
     }
 
     #[derive(Clone)]
@@ -489,6 +574,7 @@ pub use pyo3_bridge::{
     FerrousFrameworkHost, FerrousFrameworkPipe, FerrousFrameworkShell, FerrousHostConfig,
     FerrousPipeConfig, FerrousShellConfig,
 };
+pub use shutdown::{FerrousShutdownResult, FerrousShutdownStats};
 
 pub const fn pyo3_embed_enabled() -> bool {
     cfg!(feature = "pyo3-embed")
