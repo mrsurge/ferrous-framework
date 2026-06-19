@@ -126,8 +126,11 @@ fn spawns_proc_and_captures_stdout_stderr_logs() {
     assert_eq!(record.backend, "proc");
     assert_eq!(record.status, FerrousNativeShellStatus::Running);
     assert!(!record.capabilities.stdin_write);
+    assert!(!record.capabilities.stdin_eof);
     assert!(record.capabilities.stdout_log);
     assert!(record.capabilities.stderr_log);
+    assert!(!record.capabilities.output_read);
+    assert!(record.capabilities.terminate);
 
     let exited = manager
         .wait_shell_blocking(&record.id, Duration::from_secs(3))
@@ -600,7 +603,10 @@ fn fresh_manager_lists_persisted_records_as_adopted_stale_records() {
     assert_eq!(loaded.backend, "pipe");
     assert_eq!(loaded.status, FerrousNativeShellStatus::Exited);
     assert!(!loaded.capabilities.stdin_write);
+    assert!(!loaded.capabilities.stdin_eof);
     assert!(!loaded.capabilities.terminate);
+    assert!(!loaded.capabilities.output_read);
+    assert!(!loaded.capabilities.resize);
     assert!(loaded.capabilities.stdout_log);
     assert!(loaded.env.is_empty());
     assert!(
@@ -678,6 +684,8 @@ fn pipe_writes_stdin_and_reads_stdout_lines() {
 
     assert_eq!(record.backend, "pipe");
     assert!(record.capabilities.stdin_write);
+    assert!(record.capabilities.stdin_eof);
+    assert!(record.capabilities.output_read);
     assert!(
         manager
             .write_line_blocking(&record.id, r#"{"jsonrpc":"2.0","id":1}"#)
@@ -694,6 +702,53 @@ fn pipe_writes_stdin_and_reads_stdout_lines() {
             .terminate_shell_blocking(&record.id)
             .expect("terminate shell")
     );
+}
+
+#[test]
+fn pipe_can_send_stdin_eof_and_clear_live_write_capabilities() {
+    let manager = FerrousNativeManager::new();
+    let log_dir = test_log_dir("pipe-eof");
+    let record = manager
+        .spawn_pipe_blocking(base_pipe_config(
+            vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "while IFS= read -r line; do printf 'ack:%s\n' \"$line\"; done; printf closed"
+                    .to_owned(),
+            ],
+            log_dir,
+        ))
+        .expect("spawn pipe");
+
+    manager
+        .write_line_blocking(&record.id, "before-eof")
+        .expect("write line");
+    assert_eq!(
+        manager
+            .read_line_blocking(&record.id, Duration::from_secs(3))
+            .expect("read line"),
+        Some("ack:before-eof".to_owned())
+    );
+    assert!(
+        manager
+            .send_stdin_eof_blocking(&record.id)
+            .expect("send eof")
+    );
+    let after_eof = manager
+        .get_shell(&record.id)
+        .expect("get shell")
+        .expect("shell record");
+    assert!(!after_eof.capabilities.stdin_write);
+    assert!(!after_eof.capabilities.stdin_eof);
+    let error = manager
+        .write_line_blocking(&record.id, "after-eof")
+        .expect_err("write after EOF should fail");
+    assert!(error.to_string().contains("does not expose stdin"));
+    let closed = manager
+        .read_stdout_chunk_blocking(&record.id, Duration::from_secs(3))
+        .expect("read closed chunk")
+        .expect("closed chunk");
+    assert!(String::from_utf8_lossy(&closed).contains("closed"));
 }
 
 #[test]
@@ -714,6 +769,8 @@ fn pty_writes_stdin_and_reads_output_lines() {
 
     assert_eq!(record.backend, "pty");
     assert!(record.capabilities.stdin_write);
+    assert!(record.capabilities.stdin_eof);
+    assert!(record.capabilities.output_read);
     manager
         .write_line_blocking(&record.id, "hello-pty")
         .expect("write pty");
@@ -772,6 +829,10 @@ fn proc_rejects_line_io() {
         .write_line_blocking(&record.id, "ping")
         .expect_err("proc write must fail");
     assert!(error.to_string().contains("does not expose stdin"));
+    let error = manager
+        .send_stdin_eof_blocking(&record.id)
+        .expect_err("proc EOF must fail");
+    assert!(error.to_string().contains("does not expose stdin EOF"));
 }
 
 #[test]

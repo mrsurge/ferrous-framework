@@ -34,12 +34,26 @@ pub enum FerrousNativeShellStatus {
     Exited,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
 pub struct FerrousNativeShellCapabilities {
+    #[serde(default)]
     pub stdin_write: bool,
+    #[serde(default)]
+    pub stdin_eof: bool,
+    #[serde(default)]
     pub stdout_log: bool,
+    #[serde(default)]
     pub stderr_log: bool,
+    #[serde(default)]
+    pub stdout_subscribe: bool,
+    #[serde(default)]
+    pub stderr_subscribe: bool,
+    #[serde(default)]
+    pub output_read: bool,
+    #[serde(default)]
     pub terminate: bool,
+    #[serde(default)]
+    pub resize: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -378,9 +392,14 @@ impl FerrousNativeManager {
             stderr_log,
             capabilities: FerrousNativeShellCapabilities {
                 stdin_write: false,
+                stdin_eof: false,
                 stdout_log: true,
                 stderr_log: true,
+                stdout_subscribe: false,
+                stderr_subscribe: false,
+                output_read: false,
                 terminate: true,
+                resize: false,
             },
             adopted: false,
             created_at_ms: now,
@@ -470,9 +489,14 @@ impl FerrousNativeManager {
             stderr_log,
             capabilities: FerrousNativeShellCapabilities {
                 stdin_write: input.is_some(),
+                stdin_eof: input.is_some(),
                 stdout_log: true,
                 stderr_log: true,
+                stdout_subscribe: false,
+                stderr_subscribe: false,
+                output_read: true,
                 terminate: true,
+                resize: false,
             },
             adopted: false,
             created_at_ms: now,
@@ -561,9 +585,14 @@ impl FerrousNativeManager {
             stderr_log,
             capabilities: FerrousNativeShellCapabilities {
                 stdin_write: true,
+                stdin_eof: true,
                 stdout_log: true,
                 stderr_log: false,
+                stdout_subscribe: false,
+                stderr_subscribe: false,
+                output_read: true,
                 terminate: true,
+                resize: false,
             },
             adopted: false,
             created_at_ms: now,
@@ -666,6 +695,25 @@ impl FerrousNativeManager {
             .map_err(|_| anyhow!("native input lock poisoned"))?;
         input.write_all(bytes)?;
         input.flush()?;
+        Ok(true)
+    }
+
+    pub fn send_stdin_eof_blocking(&self, shell_id: &str) -> Result<bool> {
+        let input = {
+            let mut state = self.lock_state()?;
+            let Some(entry) = state.entries.get_mut(shell_id) else {
+                return Ok(false);
+            };
+            let Some(input) = entry.input.take() else {
+                bail!("native shell {shell_id} does not expose stdin EOF");
+            };
+            entry.record.capabilities.stdin_write = false;
+            entry.record.capabilities.stdin_eof = false;
+            entry.record.updated_at_ms = now_ms();
+            persist_record(&entry.record, &entry.record_path)?;
+            input
+        };
+        drop(input);
         Ok(true)
     }
 
@@ -980,7 +1028,12 @@ pub fn load_persisted_record(path: impl AsRef<Path>) -> Result<FerrousNativeShel
         .with_context(|| format!("failed to parse native record {}", path.display()))?;
     let mut capabilities = persisted.capabilities;
     capabilities.stdin_write = false;
+    capabilities.stdin_eof = false;
+    capabilities.stdout_subscribe = false;
+    capabilities.stderr_subscribe = false;
+    capabilities.output_read = false;
     capabilities.terminate = false;
+    capabilities.resize = false;
     Ok(FerrousNativeShellRecord {
         id: persisted.id,
         backend: persisted.backend,

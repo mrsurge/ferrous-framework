@@ -34,8 +34,8 @@ Current native API:
 
 ```text
 proc: launch, stdout/stderr logs, list/get, terminate, wait
-pipe: launch, direct stdin writes, direct stdout reads, stdout/stderr logs, list/get, terminate, wait
-pty: launch, direct PTY writes, direct PTY reads, PTY output log, list/get, terminate, wait
+pipe: launch, direct stdin writes/EOF, direct stdout reads, stdout/stderr logs, list/get, terminate, wait
+pty: launch, direct PTY writes/EOF, direct PTY reads, PTY output log, list/get, terminate, wait
 ```
 
 The `pipe` and `pty` hot paths are direct fd paths. They do not use a Python bridge, a stdout pump queue, or a drain worker. Reads are caller-driven and tee output to the log as bytes are read.
@@ -45,6 +45,8 @@ The `pipe` and `pty` hot paths are direct fd paths. They do not use a Python bri
 Each native launch writes a sidecar record at `FerrousNativeShellRecord.record_path`, next to the stdout/stderr logs. The sidecar records command/backend/status/log paths/capabilities/run metadata and env keys, but does not persist env values or secrets.
 
 Fresh managers can load sidecar records from the canonical store logs directory. Loaded records are marked `adopted: true`, keep log/capability metadata for inspection, and deliberately clear live-only controls such as `stdin_write` and `terminate`.
+
+Capability records distinguish logs, live output reads, stdin write, stdin EOF, terminate, and resize explicitly. Adopted/stale records clear live-only controls even if the persisted record was created by a live owner.
 
 ## FWS Environment Contract
 
