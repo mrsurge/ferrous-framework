@@ -5,13 +5,9 @@ edition = "2024"
 license = "MIT"
 repository = "https://github.com/mrsurge/ferrous-framework"
 rust-version = "1.93"
-description = "Rust adapter and runtime path for framework-shells-compatible process management"
-
-[features]
-default = []
-pyo3-embed = ["dep:pyo3"]
+description = "Rust runtime path for framework-shells-compatible process management"
 
 [dependencies]
 anyhow = "1"
-pyo3 = { version = "0.27", features = ["abi3-py311"], optional = true }
+nix = { version = "0.30", features = ["fs", "poll", "process", "term"] }
 serde_json = "1"
