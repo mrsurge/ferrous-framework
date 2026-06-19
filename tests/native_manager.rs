@@ -473,6 +473,90 @@ fn shellspec_entry_waits_for_tcp_port_readiness() {
 }
 
 #[test]
+fn shellspec_apply_starts_autostart_specs_once() {
+    let manager = test_manager_with_store("shellspec-apply-starts-once");
+    let document = json!({
+        "version": "1",
+        "shells": {
+            "disabled": {
+                "backend": "proc",
+                "command": ["sh", "-c", "sleep 30"],
+                "autostart": false
+            },
+            "worker": {
+                "backend": "pipe",
+                "command": ["sh", "-c", "while IFS= read -r line; do printf 'worker:%s\\n' \"$line\"; done"]
+            }
+        }
+    });
+
+    let started = manager
+        .apply_shellspec_document_blocking(&document, &ShellspecRenderInput::default(), false)
+        .expect("apply shellspec");
+    assert_eq!(started.len(), 1);
+    assert_eq!(started[0].spec_id, "worker");
+    assert_eq!(started[0].backend, "pipe");
+
+    let second = manager
+        .apply_shellspec_document_blocking(&document, &ShellspecRenderInput::default(), false)
+        .expect("second apply shellspec");
+    assert!(second.is_empty());
+    assert_eq!(manager.live_records().expect("live records").len(), 1);
+
+    manager
+        .write_line_blocking(&started[0].id, "ping")
+        .expect("write line");
+    let line = manager
+        .read_line_blocking(&started[0].id, Duration::from_secs(3))
+        .expect("read line")
+        .expect("line");
+    assert_eq!(line, "worker:ping");
+    assert!(
+        manager
+            .terminate_shell_blocking(&started[0].id)
+            .expect("terminate shell")
+    );
+}
+
+#[test]
+fn shellspec_apply_prunes_live_specs_not_in_desired_set() {
+    let manager = test_manager_with_store("shellspec-apply-prune");
+    let original = json!({
+        "version": "1",
+        "shells": {
+            "worker": {
+                "backend": "proc",
+                "command": ["sh", "-c", "sleep 30"]
+            }
+        }
+    });
+    let replacement = json!({
+        "version": "1",
+        "shells": {
+            "other": {
+                "backend": "proc",
+                "command": ["sh", "-c", "sleep 30"],
+                "autostart": false
+            }
+        }
+    });
+
+    let started = manager
+        .apply_shellspec_document_blocking(&original, &ShellspecRenderInput::default(), false)
+        .expect("apply original");
+    assert_eq!(started.len(), 1);
+    let pruned_start = manager
+        .apply_shellspec_document_blocking(&replacement, &ShellspecRenderInput::default(), true)
+        .expect("apply replacement with prune");
+    assert!(pruned_start.is_empty());
+    let exited = manager
+        .wait_shell_blocking(&started[0].id, Duration::from_secs(3))
+        .expect("wait shell")
+        .expect("shell record");
+    assert_eq!(exited.status, FerrousNativeShellStatus::Exited);
+}
+
+#[test]
 fn fresh_manager_lists_persisted_records_as_adopted_stale_records() {
     let manager = test_manager_with_store("persisted-record-list");
     let mut config = base_pipe_config(

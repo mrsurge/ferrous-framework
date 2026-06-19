@@ -1,5 +1,6 @@
 use crate::shellspec::{
-    RenderedReadinessProbe, RenderedShellSpec, ShellspecRenderInput, render_shellspec_entry,
+    RenderedReadinessProbe, RenderedShellSpec, ShellspecRenderInput, render_shellspec_entries,
+    render_shellspec_entry,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use nix::{
@@ -13,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     env,
     fs::{File, OpenOptions, create_dir_all, read_dir, read_to_string, rename},
     io::{BufWriter, Read, Write},
@@ -273,6 +274,45 @@ impl FerrousNativeManager {
             }
         }
         Ok(record)
+    }
+
+    pub fn apply_shellspec_document_blocking(
+        &self,
+        document: &Value,
+        input: &ShellspecRenderInput,
+        prune: bool,
+    ) -> Result<Vec<FerrousNativeShellRecord>> {
+        let specs = render_shellspec_entries(document, input)?;
+        self.apply_rendered_shellspecs_blocking(specs, prune)
+    }
+
+    pub fn apply_rendered_shellspecs_blocking(
+        &self,
+        specs: Vec<RenderedShellSpec>,
+        prune: bool,
+    ) -> Result<Vec<FerrousNativeShellRecord>> {
+        let desired_ids = specs
+            .iter()
+            .map(|spec| spec.id.clone())
+            .collect::<HashSet<_>>();
+        let mut started = Vec::new();
+        for spec in specs {
+            if !spec.autostart {
+                continue;
+            }
+            if self.live_running_record_by_spec_id(&spec.id)?.is_some() {
+                continue;
+            }
+            started.push(self.spawn_rendered_shellspec_blocking(spec)?);
+        }
+        if prune {
+            for record in self.live_records()? {
+                if !desired_ids.contains(&record.spec_id) {
+                    let _ = self.terminate_shell_blocking(&record.id)?;
+                }
+            }
+        }
+        Ok(started)
     }
 
     pub fn spawn_proc_blocking(
@@ -574,6 +614,17 @@ impl FerrousNativeManager {
         list_persisted_records_in_dir(&self.store.logs_dir)
     }
 
+    pub fn live_records(&self) -> Result<Vec<FerrousNativeShellRecord>> {
+        let state = self.lock_state()?;
+        let mut records = state
+            .entries
+            .values()
+            .map(|entry| entry.record.clone())
+            .collect::<Vec<_>>();
+        records.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(records)
+    }
+
     pub fn terminate_shell_blocking(&self, shell_id: &str) -> Result<bool> {
         let child = {
             let state = self.lock_state()?;
@@ -670,6 +721,21 @@ impl FerrousNativeManager {
             return Ok(None);
         };
         Ok(entry.output.clone())
+    }
+
+    fn live_running_record_by_spec_id(
+        &self,
+        spec_id: &str,
+    ) -> Result<Option<FerrousNativeShellRecord>> {
+        let state = self.lock_state()?;
+        Ok(state
+            .entries
+            .values()
+            .find(|entry| {
+                entry.record.spec_id == spec_id
+                    && entry.record.status == FerrousNativeShellStatus::Running
+            })
+            .map(|entry| entry.record.clone()))
     }
 
     fn insert_entry(

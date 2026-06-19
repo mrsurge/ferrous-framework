@@ -51,6 +51,23 @@ pub fn render_shellspec_entry(
     parse_shellspec_entry(&rendered, entry)
 }
 
+pub fn render_shellspec_entries(
+    document: &Value,
+    input: &ShellspecRenderInput,
+) -> Result<Vec<RenderedShellSpec>> {
+    let rendered = render_shellspec_value(document, input)?;
+    let shells = rendered
+        .get("shells")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("shellspec document missing shells object"))?;
+    let mut entries = shells.keys().cloned().collect::<Vec<_>>();
+    entries.sort();
+    entries
+        .iter()
+        .map(|entry| parse_shellspec_entry(&rendered, entry))
+        .collect()
+}
+
 pub fn parse_shellspec_entry(document: &Value, entry: &str) -> Result<RenderedShellSpec> {
     let shells = document
         .get("shells")

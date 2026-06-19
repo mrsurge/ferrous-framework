@@ -100,6 +100,8 @@ The current fixture set covers `proc`, `pipe`, and `pty` render surfaces, ctx/en
 
 Ferrous can also launch a rendered shellspec entry directly through `FerrousNativeManager::spawn_shellspec_entry_blocking(...)`. The API renders the selected entry, parses command/env/subgroups/backend, and dispatches to native `proc`, `pipe`, or `pty`. Shellspec `command` may be a string array or a shell-style command string. Direct launch waits for supported readiness probes (`tcp_port`, `stdout_regex`) and rejects unsupported probe types explicitly.
 
+For multi-entry shellspec documents, `FerrousNativeManager::apply_shellspec_document_blocking(...)` starts missing `autostart` specs, skips live running specs with the same `spec_id`, and can prune live specs that are no longer present in the desired document.
+
 ## Test/Bench Signals
 
 The native pipe tests include JSON-RPC-shaped request/response coverage with interleaved notifications and visible timing output when run with `-- --nocapture`:
