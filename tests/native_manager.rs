@@ -1,8 +1,9 @@
 use ferrous_framework::{
     FerrousNativeEnv, FerrousNativeManager, FerrousNativePipeConfig, FerrousNativeProcConfig,
     FerrousNativePtyConfig, FerrousNativeShellStatus, FerrousNativeStore,
+    shellspec::ShellspecRenderInput,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     fs,
@@ -131,8 +132,8 @@ fn spawns_proc_and_captures_stdout_stderr_logs() {
     assert_eq!(exited.status, FerrousNativeShellStatus::Exited);
     assert_eq!(exited.exit_code, Some(0));
 
-    let stdout = fs::read_to_string(&exited.stdout_log).expect("stdout log");
-    let stderr = fs::read_to_string(&exited.stderr_log).expect("stderr log");
+    let stdout = eventually_read_to_string(&exited.stdout_log, Duration::from_secs(3));
+    let stderr = eventually_read_to_string(&exited.stderr_log, Duration::from_secs(3));
     assert_eq!(stdout, "hello stdout");
     assert_eq!(stderr, "hello stderr");
 
@@ -299,6 +300,113 @@ fn omitted_log_dir_uses_fws_runtime_store_logs_dir() {
         .expect("wait shell")
         .expect("shell record");
     assert_eq!(exited.status, FerrousNativeShellStatus::Exited);
+}
+
+#[test]
+fn shellspec_entry_launches_native_pipe_with_rendered_ctx_and_env() {
+    let manager = test_manager_with_store("shellspec-pipe-launch");
+    let document = json!({
+        "version": "1",
+        "shells": {
+            "jsonrpc_pipe": {
+                "backend": "pipe",
+                "command": ["sh", "-c", "while IFS= read -r line; do printf '%s:%s\\n' \"$APP_ID\" \"$line\"; done"],
+                "env": {
+                    "APP_ID": "${ctx:APP_ID}",
+                    "FROM_ENV": "${env:FROM_ENV}"
+                },
+                "subgroups": ["pipe", "${APP_ID}"]
+            }
+        }
+    });
+    let input = ShellspecRenderInput {
+        ctx: HashMap::from([("APP_ID".to_owned(), "native-shellspec".to_owned())]),
+        env: HashMap::from([("FROM_ENV".to_owned(), "external".to_owned())]),
+    };
+    let record = manager
+        .spawn_shellspec_entry_blocking(&document, "jsonrpc_pipe", &input)
+        .expect("spawn shellspec pipe");
+
+    assert_eq!(record.backend, "pipe");
+    assert_eq!(record.spec_id, "jsonrpc_pipe");
+    assert_eq!(record.label, "jsonrpc_pipe");
+    assert_eq!(record.subgroups, vec!["pipe", "native-shellspec"]);
+    assert!(record.stdout_log.starts_with(manager.logs_dir()));
+    assert_eq!(
+        record.env.get("APP_ID").map(String::as_str),
+        Some("native-shellspec")
+    );
+    assert_eq!(
+        record.env.get("FROM_ENV").map(String::as_str),
+        Some("external")
+    );
+
+    manager
+        .write_line_blocking(&record.id, "ping")
+        .expect("write line");
+    let line = manager
+        .read_line_blocking(&record.id, Duration::from_secs(3))
+        .expect("read line")
+        .expect("line");
+    assert_eq!(line, "native-shellspec:ping");
+    assert!(
+        manager
+            .terminate_shell_blocking(&record.id)
+            .expect("terminate shell")
+    );
+}
+
+#[test]
+fn shellspec_entry_launches_command_string_proc_with_shlex_split() {
+    let manager = test_manager_with_store("shellspec-proc-command-string");
+    let document = json!({
+        "version": "1",
+        "shells": {
+            "worker": {
+                "backend": "proc",
+                "command": "sh -c 'printf shellspec:$APP_ID'",
+                "env": {
+                    "APP_ID": "${APP_ID}"
+                }
+            }
+        }
+    });
+    let input = ShellspecRenderInput {
+        ctx: HashMap::from([("APP_ID".to_owned(), "proc-app".to_owned())]),
+        env: HashMap::new(),
+    };
+    let record = manager
+        .spawn_shellspec_entry_blocking(&document, "worker", &input)
+        .expect("spawn shellspec proc");
+    let exited = manager
+        .wait_shell_blocking(&record.id, Duration::from_secs(3))
+        .expect("wait shell")
+        .expect("shell record");
+
+    assert_eq!(exited.status, FerrousNativeShellStatus::Exited);
+    assert_eq!(
+        eventually_read_to_string(&exited.stdout_log, Duration::from_secs(3)),
+        "shellspec:proc-app"
+    );
+}
+
+#[test]
+fn shellspec_entry_rejects_autostart_false() {
+    let manager = test_manager_with_store("shellspec-autostart-false");
+    let document = json!({
+        "version": "1",
+        "shells": {
+            "disabled": {
+                "backend": "proc",
+                "command": ["sh", "-c", "printf no"],
+                "autostart": false
+            }
+        }
+    });
+    let error = manager
+        .spawn_shellspec_entry_blocking(&document, "disabled", &ShellspecRenderInput::default())
+        .expect_err("autostart false should not launch");
+    assert!(error.to_string().contains("autostart=false"));
 }
 
 #[test]

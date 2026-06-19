@@ -1,3 +1,4 @@
+use crate::shellspec::{RenderedShellSpec, ShellspecRenderInput, render_shellspec_entry};
 use anyhow::{Context, Result, anyhow, bail};
 use nix::{
     fcntl::{FcntlArg, OFlag, fcntl},
@@ -6,6 +7,7 @@ use nix::{
     unistd::dup,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap},
@@ -206,6 +208,55 @@ impl FerrousNativeManager {
 
     pub fn child_env_overlay(&self) -> HashMap<String, String> {
         self.native_env.child_env_overlay()
+    }
+
+    pub fn spawn_shellspec_entry_blocking(
+        &self,
+        document: &Value,
+        entry: &str,
+        input: &ShellspecRenderInput,
+    ) -> Result<FerrousNativeShellRecord> {
+        let spec = render_shellspec_entry(document, entry, input)?;
+        self.spawn_rendered_shellspec_blocking(spec)
+    }
+
+    pub fn spawn_rendered_shellspec_blocking(
+        &self,
+        spec: RenderedShellSpec,
+    ) -> Result<FerrousNativeShellRecord> {
+        if !spec.autostart {
+            bail!("shellspec '{}' has autostart=false", spec.id);
+        }
+        match spec.backend.as_str() {
+            "proc" => self.spawn_proc_blocking(FerrousNativeProcConfig {
+                command: spec.command,
+                cwd: spec.cwd,
+                env: spec.env,
+                label: spec.id.clone(),
+                spec_id: spec.id,
+                subgroups: spec.subgroups,
+                log_dir: None,
+            }),
+            "pipe" => self.spawn_pipe_blocking(FerrousNativePipeConfig {
+                command: spec.command,
+                cwd: spec.cwd,
+                env: spec.env,
+                label: spec.id.clone(),
+                spec_id: spec.id,
+                subgroups: spec.subgroups,
+                log_dir: None,
+            }),
+            "pty" => self.spawn_pty_blocking(FerrousNativePtyConfig {
+                command: spec.command,
+                cwd: spec.cwd,
+                env: spec.env,
+                label: spec.id.clone(),
+                spec_id: spec.id,
+                subgroups: spec.subgroups,
+                log_dir: None,
+            }),
+            backend => bail!("unsupported native shellspec backend '{backend}'"),
+        }
     }
 
     pub fn spawn_proc_blocking(

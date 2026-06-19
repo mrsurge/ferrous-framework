@@ -27,6 +27,8 @@ Current native API:
 - `FerrousNativeShellStatus`
 - `FerrousNativeShellCapabilities`
 - `load_persisted_record`
+- `shellspec::render_shellspec_entry`
+- `FerrousNativeManager::spawn_shellspec_entry_blocking`
 
 ## Native Backend Coverage
 
@@ -95,6 +97,8 @@ cargo test
 ```
 
 The current fixture set covers `proc`, `pipe`, and `pty` render surfaces, ctx/env precedence, missing values, and stable free-port substitution.
+
+Ferrous can also launch a rendered shellspec entry directly through `FerrousNativeManager::spawn_shellspec_entry_blocking(...)`. The API renders the selected entry, parses command/env/subgroups/backend, and dispatches to native `proc`, `pipe`, or `pty`. Shellspec `command` may be a string array or a shell-style command string.
 
 ## Test/Bench Signals
 
