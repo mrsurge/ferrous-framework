@@ -19,12 +19,14 @@ Current native API:
 
 - `FerrousNativeManager`
 - `FerrousNativeEnv`
+- `FerrousNativeStore`
 - `FerrousNativeProcConfig`
 - `FerrousNativePipeConfig`
 - `FerrousNativePtyConfig`
 - `FerrousNativeShellRecord`
 - `FerrousNativeShellStatus`
 - `FerrousNativeShellCapabilities`
+- `load_persisted_record`
 
 ## Native Backend Coverage
 
@@ -39,6 +41,8 @@ The `pipe` and `pty` hot paths are direct fd paths. They do not use a Python bri
 `FerrousNativeManager::new()` uses the same store layout as Python FWS: `FRAMEWORK_SHELLS_BASE_DIR` or `~/.cache/framework_shells`, `runtimes/<repo_fingerprint>/<runtime_id>/logs`, where `runtime_id` is `sha256(secret)[:16]`. If a spawn config leaves `log_dir` as `None`, logs and sidecar records are written into that canonical FWS logs directory. `Some(path)` remains an explicit override.
 
 Each native launch writes a sidecar record at `FerrousNativeShellRecord.record_path`, next to the stdout/stderr logs. The sidecar records command/backend/status/log paths/capabilities/run metadata and env keys, but does not persist env values or secrets.
+
+Fresh managers can load sidecar records from the canonical store logs directory. Loaded records are marked `adopted: true`, keep log/capability metadata for inspection, and deliberately clear live-only controls such as `stdin_write` and `terminate`.
 
 ## FWS Environment Contract
 

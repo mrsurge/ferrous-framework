@@ -5,29 +5,29 @@ use nix::{
     pty::openpty,
     unistd::dup,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     env,
-    fs::{File, OpenOptions, create_dir_all, read_to_string, rename},
+    fs::{File, OpenOptions, create_dir_all, read_dir, read_to_string, rename},
     io::{BufWriter, Read, Write},
     os::fd::{AsFd, AsRawFd, BorrowedFd},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FerrousNativeShellStatus {
     Running,
     Exited,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct FerrousNativeShellCapabilities {
     pub stdin_write: bool,
     pub stdout_log: bool,
@@ -42,6 +42,7 @@ pub struct FerrousNativeShellRecord {
     pub command: Vec<String>,
     pub cwd: Option<PathBuf>,
     pub env: HashMap<String, String>,
+    pub env_keys: Vec<String>,
     pub pid: u32,
     pub status: FerrousNativeShellStatus,
     pub exit_code: Option<i32>,
@@ -52,6 +53,7 @@ pub struct FerrousNativeShellRecord {
     pub stdout_log: PathBuf,
     pub stderr_log: PathBuf,
     pub capabilities: FerrousNativeShellCapabilities,
+    pub adopted: bool,
     pub created_at_ms: u128,
     pub updated_at_ms: u128,
 }
@@ -132,28 +134,28 @@ struct NativeShellEntry {
     output: Option<Arc<Mutex<DirectOutput>>>,
 }
 
-#[derive(Serialize)]
-struct PersistedNativeShellRecord<'a> {
-    id: &'a str,
-    spec_id: &'a str,
-    backend: &'a str,
-    command: &'a [String],
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PersistedNativeShellRecord {
+    id: String,
+    spec_id: String,
+    backend: String,
+    command: Vec<String>,
     cwd: Option<String>,
     pid: u32,
-    status: &'a FerrousNativeShellStatus,
+    status: FerrousNativeShellStatus,
     exit_code: Option<i32>,
-    label: &'a str,
-    subgroups: &'a [String],
+    label: String,
+    subgroups: Vec<String>,
     record_path: String,
     stdout_log: String,
     stderr_log: String,
     io_metadata_log: Option<String>,
     created_at_ms: u128,
     updated_at_ms: u128,
-    run_id: Option<&'a str>,
+    run_id: Option<String>,
     launcher_pid: u32,
     env_keys: Vec<String>,
-    capabilities: &'a FerrousNativeShellCapabilities,
+    capabilities: FerrousNativeShellCapabilities,
 }
 
 struct DirectOutput {
@@ -256,6 +258,7 @@ impl FerrousNativeManager {
             backend: "proc".to_owned(),
             command: config.command,
             cwd: config.cwd,
+            env_keys: sorted_env_keys(&child_env),
             env: child_env,
             pid,
             status: FerrousNativeShellStatus::Running,
@@ -272,6 +275,7 @@ impl FerrousNativeManager {
                 stderr_log: true,
                 terminate: true,
             },
+            adopted: false,
             created_at_ms: now,
             updated_at_ms: now,
         };
@@ -346,6 +350,7 @@ impl FerrousNativeManager {
             backend: "pipe".to_owned(),
             command: config.command,
             cwd: config.cwd,
+            env_keys: sorted_env_keys(&child_env),
             env: child_env,
             pid,
             status: FerrousNativeShellStatus::Running,
@@ -362,6 +367,7 @@ impl FerrousNativeManager {
                 stderr_log: true,
                 terminate: true,
             },
+            adopted: false,
             created_at_ms: now,
             updated_at_ms: now,
         };
@@ -435,6 +441,7 @@ impl FerrousNativeManager {
             backend: "pty".to_owned(),
             command: config.command,
             cwd: config.cwd,
+            env_keys: sorted_env_keys(&child_env),
             env: child_env,
             pid,
             status: FerrousNativeShellStatus::Running,
@@ -451,6 +458,7 @@ impl FerrousNativeManager {
                 stderr_log: false,
                 terminate: true,
             },
+            adopted: false,
             created_at_ms: now,
             updated_at_ms: now,
         };
@@ -469,22 +477,34 @@ impl FerrousNativeManager {
     }
 
     pub fn list_shells(&self) -> Result<Vec<FerrousNativeShellRecord>> {
+        let mut records = self
+            .list_persisted_records()?
+            .into_iter()
+            .map(|record| (record.id.clone(), record))
+            .collect::<BTreeMap<_, _>>();
         let state = self.lock_state()?;
-        let mut records = state
-            .entries
-            .values()
-            .map(|entry| entry.record.clone())
-            .collect::<Vec<_>>();
-        records.sort_by(|left, right| left.id.cmp(&right.id));
-        Ok(records)
+        for entry in state.entries.values() {
+            records.insert(entry.record.id.clone(), entry.record.clone());
+        }
+        Ok(records.into_values().collect())
     }
 
     pub fn get_shell(&self, shell_id: &str) -> Result<Option<FerrousNativeShellRecord>> {
-        let state = self.lock_state()?;
-        Ok(state
-            .entries
-            .get(shell_id)
-            .map(|entry| entry.record.clone()))
+        {
+            let state = self.lock_state()?;
+            if let Some(entry) = state.entries.get(shell_id) {
+                return Ok(Some(entry.record.clone()));
+            }
+        }
+        let record_path = record_path_for(&self.store.logs_dir, shell_id);
+        if record_path.exists() {
+            return Ok(Some(load_persisted_record(&record_path)?));
+        }
+        Ok(None)
+    }
+
+    pub fn list_persisted_records(&self) -> Result<Vec<FerrousNativeShellRecord>> {
+        list_persisted_records_in_dir(&self.store.logs_dir)
     }
 
     pub fn terminate_shell_blocking(&self, shell_id: &str) -> Result<bool> {
@@ -819,31 +839,91 @@ fn record_path_for(log_dir: &std::path::Path, shell_id: &str) -> PathBuf {
     log_dir.join(format!("{shell_id}.record.json"))
 }
 
+pub fn load_persisted_record(path: impl AsRef<Path>) -> Result<FerrousNativeShellRecord> {
+    let path = path.as_ref();
+    let raw = read_to_string(path)
+        .with_context(|| format!("failed to read native record {}", path.display()))?;
+    let persisted = serde_json::from_str::<PersistedNativeShellRecord>(&raw)
+        .with_context(|| format!("failed to parse native record {}", path.display()))?;
+    let mut capabilities = persisted.capabilities;
+    capabilities.stdin_write = false;
+    capabilities.terminate = false;
+    Ok(FerrousNativeShellRecord {
+        id: persisted.id,
+        backend: persisted.backend,
+        command: persisted.command,
+        cwd: persisted.cwd.map(PathBuf::from),
+        env: HashMap::new(),
+        env_keys: persisted.env_keys,
+        pid: persisted.pid,
+        status: persisted.status,
+        exit_code: persisted.exit_code,
+        label: persisted.label,
+        spec_id: persisted.spec_id,
+        subgroups: persisted.subgroups,
+        record_path: PathBuf::from(persisted.record_path),
+        stdout_log: PathBuf::from(persisted.stdout_log),
+        stderr_log: PathBuf::from(persisted.stderr_log),
+        capabilities,
+        adopted: true,
+        created_at_ms: persisted.created_at_ms,
+        updated_at_ms: persisted.updated_at_ms,
+    })
+}
+
+fn list_persisted_records_in_dir(logs_dir: &Path) -> Result<Vec<FerrousNativeShellRecord>> {
+    if !logs_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut records = Vec::new();
+    for entry in read_dir(logs_dir)
+        .with_context(|| format!("failed to read native record dir {}", logs_dir.display()))?
+    {
+        let entry = entry.with_context(|| {
+            format!(
+                "failed to read native record dir entry {}",
+                logs_dir.display()
+            )
+        })?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        if !path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(|name| name.ends_with(".record.json"))
+        {
+            continue;
+        }
+        records.push(load_persisted_record(path)?);
+    }
+    records.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(records)
+}
+
 fn persist_record(record: &FerrousNativeShellRecord, path: &std::path::Path) -> Result<()> {
     let persisted = PersistedNativeShellRecord {
-        id: &record.id,
-        spec_id: &record.spec_id,
-        backend: &record.backend,
-        command: &record.command,
+        id: record.id.clone(),
+        spec_id: record.spec_id.clone(),
+        backend: record.backend.clone(),
+        command: record.command.clone(),
         cwd: record.cwd.as_ref().map(path_to_string),
         pid: record.pid,
-        status: &record.status,
+        status: record.status.clone(),
         exit_code: record.exit_code,
-        label: &record.label,
-        subgroups: &record.subgroups,
+        label: record.label.clone(),
+        subgroups: record.subgroups.clone(),
         record_path: path_to_string(&record.record_path),
         stdout_log: path_to_string(&record.stdout_log),
         stderr_log: path_to_string(&record.stderr_log),
         io_metadata_log: None,
         created_at_ms: record.created_at_ms,
         updated_at_ms: record.updated_at_ms,
-        run_id: record
-            .env
-            .get("FRAMEWORK_SHELLS_RUN_ID")
-            .map(String::as_str),
+        run_id: record.env.get("FRAMEWORK_SHELLS_RUN_ID").cloned(),
         launcher_pid: std::process::id(),
-        env_keys: sorted_env_keys(&record.env),
-        capabilities: &record.capabilities,
+        env_keys: record.env_keys.clone(),
+        capabilities: record.capabilities.clone(),
     };
     let tmp_path = path.with_extension("record.json.tmp");
     let file = File::create(&tmp_path)

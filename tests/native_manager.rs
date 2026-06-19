@@ -302,6 +302,78 @@ fn omitted_log_dir_uses_fws_runtime_store_logs_dir() {
 }
 
 #[test]
+fn fresh_manager_lists_persisted_records_as_adopted_stale_records() {
+    let manager = test_manager_with_store("persisted-record-list");
+    let mut config = base_pipe_config(
+        vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "while IFS= read -r line; do printf 'ack:%s\n' \"$line\"; done".to_owned(),
+        ],
+        test_log_dir("unused-persisted-record-list"),
+    );
+    config.log_dir = None;
+    let record = manager.spawn_pipe_blocking(config).expect("spawn pipe");
+    assert!(
+        manager
+            .write_line_blocking(&record.id, "first")
+            .expect("write line")
+    );
+    let line = manager
+        .read_line_blocking(&record.id, Duration::from_secs(3))
+        .expect("read line")
+        .expect("line");
+    assert_eq!(line, "ack:first");
+    assert!(
+        manager
+            .terminate_shell_blocking(&record.id)
+            .expect("terminate shell")
+    );
+    let exited = manager
+        .wait_shell_blocking(&record.id, Duration::from_secs(3))
+        .expect("wait shell")
+        .expect("shell record");
+    assert_eq!(exited.status, FerrousNativeShellStatus::Exited);
+
+    let fresh = FerrousNativeManager::with_store_and_env(manager.store(), manager.native_env());
+    let loaded = fresh
+        .get_shell(&record.id)
+        .expect("get persisted shell")
+        .expect("persisted shell");
+    assert!(loaded.adopted);
+    assert_eq!(loaded.id, record.id);
+    assert_eq!(loaded.backend, "pipe");
+    assert_eq!(loaded.status, FerrousNativeShellStatus::Exited);
+    assert!(!loaded.capabilities.stdin_write);
+    assert!(!loaded.capabilities.terminate);
+    assert!(loaded.capabilities.stdout_log);
+    assert!(loaded.env.is_empty());
+    assert!(
+        loaded
+            .env_keys
+            .iter()
+            .any(|key| key == "FRAMEWORK_SHELLS_RUN_ID")
+    );
+    assert_eq!(
+        fresh
+            .write_line_blocking(&record.id, "second")
+            .expect("stale write should report unavailable"),
+        false
+    );
+    assert_eq!(
+        fresh
+            .terminate_shell_blocking(&record.id)
+            .expect("stale terminate should report unavailable"),
+        false
+    );
+
+    let listed = fresh.list_shells().expect("list persisted shells");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, record.id);
+    assert!(listed[0].adopted);
+}
+
+#[test]
 fn terminates_running_proc() {
     let manager = FerrousNativeManager::new();
     let log_dir = test_log_dir("terminates-proc");
