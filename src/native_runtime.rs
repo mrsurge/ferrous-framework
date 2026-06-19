@@ -5,6 +5,7 @@ use crate::shellspec::{
 use anyhow::{Context, Result, anyhow, bail};
 use nix::{
     fcntl::{FcntlArg, OFlag, fcntl},
+    libc,
     poll::{PollFd, PollFlags, PollTimeout, poll},
     pty::openpty,
     unistd::dup,
@@ -157,6 +158,7 @@ struct NativeShellEntry {
     child: Arc<Mutex<Child>>,
     input: Option<Arc<Mutex<Box<dyn Write + Send>>>>,
     output: Option<Arc<Mutex<DirectOutput>>>,
+    resize: Option<Arc<File>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -466,6 +468,7 @@ impl FerrousNativeManager {
             Arc::clone(&child),
             None,
             None,
+            None,
         )?;
         self.reactor.watch_child(id, child)?;
         Ok(record)
@@ -564,6 +567,7 @@ impl FerrousNativeManager {
             Arc::clone(&child),
             input,
             output,
+            None,
         )?;
         self.reactor.watch_child(id, child)?;
         Ok(record)
@@ -594,6 +598,7 @@ impl FerrousNativeManager {
         let slave_stdout = dup(&pty.slave).context("failed to duplicate PTY slave stdout")?;
         let slave_stderr = pty.slave;
         let master_input = dup(&pty.master).context("failed to duplicate PTY master input")?;
+        let master_resize = dup(&pty.master).context("failed to duplicate PTY master resize fd")?;
         let master_output = File::from(pty.master);
         set_nonblocking(&master_output)?;
         let child_env = self.merged_child_env(config.env);
@@ -645,7 +650,7 @@ impl FerrousNativeManager {
                 stderr_subscribe: false,
                 output_read: true,
                 terminate: true,
-                resize: false,
+                resize: true,
             },
             adopted: false,
             created_at_ms: now,
@@ -660,6 +665,7 @@ impl FerrousNativeManager {
             Arc::clone(&child),
             input,
             output,
+            Some(Arc::new(File::from(master_resize))),
         )?;
         self.reactor.watch_child(id, child)?;
         Ok(record)
@@ -770,6 +776,21 @@ impl FerrousNativeManager {
         Ok(true)
     }
 
+    pub fn resize_pty_blocking(&self, shell_id: &str, cols: u16, rows: u16) -> Result<bool> {
+        let resize = {
+            let state = self.lock_state()?;
+            let Some(entry) = state.entries.get(shell_id) else {
+                return Ok(false);
+            };
+            entry.resize.clone()
+        };
+        let Some(resize) = resize else {
+            bail!("native shell {shell_id} does not expose PTY resize");
+        };
+        apply_pty_resize(resize.as_raw_fd(), cols, rows)?;
+        Ok(true)
+    }
+
     pub fn read_stdout_chunk_blocking(
         &self,
         shell_id: &str,
@@ -847,6 +868,7 @@ impl FerrousNativeManager {
         child: Arc<Mutex<Child>>,
         input: Option<Arc<Mutex<Box<dyn Write + Send>>>>,
         output: Option<Arc<Mutex<DirectOutput>>>,
+        resize: Option<Arc<File>>,
     ) -> Result<()> {
         let mut state = self.lock_state()?;
         state.entries.insert(
@@ -857,6 +879,7 @@ impl FerrousNativeManager {
                 child,
                 input,
                 output,
+                resize,
             },
         );
         Ok(())
@@ -1192,6 +1215,23 @@ fn sorted_env_keys(env: &HashMap<String, String>) -> Vec<String> {
 fn set_nonblocking(fd: &impl AsFd) -> Result<()> {
     let flags = OFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFL)?);
     fcntl(fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
+    Ok(())
+}
+
+fn apply_pty_resize(fd: i32, cols: u16, rows: u16) -> Result<()> {
+    let size = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: fd is a live PTY master fd owned by the native shell entry, and
+    // the pointer references a stack-allocated winsize for the duration of the
+    // ioctl call.
+    let result = unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &size) };
+    if result == -1 {
+        return Err(std::io::Error::last_os_error()).context("failed to resize native PTY");
+    }
     Ok(())
 }
 

@@ -131,6 +131,7 @@ fn spawns_proc_and_captures_stdout_stderr_logs() {
     assert!(record.capabilities.stderr_log);
     assert!(!record.capabilities.output_read);
     assert!(record.capabilities.terminate);
+    assert!(!record.capabilities.resize);
 
     let exited = manager
         .wait_shell_blocking(&record.id, Duration::from_secs(3))
@@ -686,6 +687,7 @@ fn pipe_writes_stdin_and_reads_stdout_lines() {
     assert!(record.capabilities.stdin_write);
     assert!(record.capabilities.stdin_eof);
     assert!(record.capabilities.output_read);
+    assert!(!record.capabilities.resize);
     assert!(
         manager
             .write_line_blocking(&record.id, r#"{"jsonrpc":"2.0","id":1}"#)
@@ -771,6 +773,12 @@ fn pty_writes_stdin_and_reads_output_lines() {
     assert!(record.capabilities.stdin_write);
     assert!(record.capabilities.stdin_eof);
     assert!(record.capabilities.output_read);
+    assert!(record.capabilities.resize);
+    assert!(
+        manager
+            .resize_pty_blocking(&record.id, 100, 30)
+            .expect("resize pty")
+    );
     manager
         .write_line_blocking(&record.id, "hello-pty")
         .expect("write pty");
@@ -833,6 +841,10 @@ fn proc_rejects_line_io() {
         .send_stdin_eof_blocking(&record.id)
         .expect_err("proc EOF must fail");
     assert!(error.to_string().contains("does not expose stdin EOF"));
+    let error = manager
+        .resize_pty_blocking(&record.id, 80, 24)
+        .expect_err("proc resize must fail");
+    assert!(error.to_string().contains("does not expose PTY resize"));
 }
 
 #[test]
