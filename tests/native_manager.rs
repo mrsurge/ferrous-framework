@@ -1,6 +1,6 @@
 use ferrous_framework::{
-    FerrousNativeManager, FerrousNativePipeConfig, FerrousNativeProcConfig, FerrousNativePtyConfig,
-    FerrousNativeShellStatus,
+    FerrousNativeEnv, FerrousNativeManager, FerrousNativePipeConfig, FerrousNativeProcConfig,
+    FerrousNativePtyConfig, FerrousNativeShellStatus,
 };
 use serde_json::Value;
 use std::{
@@ -64,6 +64,16 @@ fn jsonrpc_echo_command() -> Vec<String> {
     vec![env!("CARGO_BIN_EXE_ferrous-jsonrpc-echo").to_owned()]
 }
 
+fn test_native_env() -> FerrousNativeEnv {
+    FerrousNativeEnv {
+        secret: "secret-from-manager".to_owned(),
+        run_id: "run-from-manager".to_owned(),
+        fws_socketio_url: Some("http://127.0.0.1:19099/fws_ws".to_owned()),
+        te_framework_url: Some("http://127.0.0.1:19099".to_owned()),
+        extra: HashMap::from([("FERROUS_EXTRA".to_owned(), "extra-from-manager".to_owned())]),
+    }
+}
+
 #[test]
 fn spawns_proc_and_captures_stdout_stderr_logs() {
     let manager = FerrousNativeManager::new();
@@ -100,6 +110,129 @@ fn spawns_proc_and_captures_stdout_stderr_logs() {
     let listed = manager.list_shells().expect("list shells");
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].id, record.id);
+}
+
+#[test]
+fn native_env_overlay_reaches_proc_children() {
+    let manager = FerrousNativeManager::with_env(test_native_env());
+    let log_dir = test_log_dir("proc-native-env");
+    let mut config = base_proc_config(
+        vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "printf '%s|%s|%s|%s|%s' \"$FRAMEWORK_SHELLS_SECRET\" \"$FRAMEWORK_SHELLS_RUN_ID\" \"$FRAMEWORK_SHELLS_FWS_SOCKETIO_URL\" \"$TE_FRAMEWORK_URL\" \"$FERROUS_EXTRA\"".to_owned(),
+        ],
+        log_dir,
+    );
+    config.env.insert(
+        "FRAMEWORK_SHELLS_SECRET".to_owned(),
+        "secret-from-shell".to_owned(),
+    );
+    let record = manager.spawn_proc_blocking(config).expect("spawn proc");
+    let exited = manager
+        .wait_shell_blocking(&record.id, Duration::from_secs(3))
+        .expect("wait shell")
+        .expect("shell record");
+
+    assert_eq!(
+        exited
+            .env
+            .get("FRAMEWORK_SHELLS_SECRET")
+            .map(String::as_str),
+        Some("secret-from-shell")
+    );
+    assert_eq!(
+        eventually_read_to_string(&exited.stdout_log, Duration::from_secs(3)),
+        "secret-from-shell|run-from-manager|http://127.0.0.1:19099/fws_ws|http://127.0.0.1:19099|extra-from-manager"
+    );
+}
+
+#[test]
+fn native_env_overlay_reaches_pipe_children() {
+    let manager = FerrousNativeManager::with_env(test_native_env());
+    let log_dir = test_log_dir("pipe-native-env");
+    let record = manager
+        .spawn_pipe_blocking(base_pipe_config(
+            vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "printf '%s|%s|%s|%s\n' \"$FRAMEWORK_SHELLS_SECRET\" \"$FRAMEWORK_SHELLS_RUN_ID\" \"$FRAMEWORK_SHELLS_FWS_SOCKETIO_URL\" \"$TE_FRAMEWORK_URL\"; sleep 30".to_owned(),
+            ],
+            log_dir,
+        ))
+        .expect("spawn pipe");
+
+    let line = manager
+        .read_line_blocking(&record.id, Duration::from_secs(3))
+        .expect("read line")
+        .expect("env line");
+    assert_eq!(
+        line,
+        "secret-from-manager|run-from-manager|http://127.0.0.1:19099/fws_ws|http://127.0.0.1:19099"
+    );
+    assert!(
+        manager
+            .terminate_shell_blocking(&record.id)
+            .expect("terminate shell")
+    );
+}
+
+#[test]
+fn native_record_sidecar_is_persisted_without_env_values() {
+    let manager = FerrousNativeManager::with_env(test_native_env());
+    let log_dir = test_log_dir("record-sidecar");
+    let mut config = base_proc_config(
+        vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "printf persisted".to_owned(),
+        ],
+        log_dir.clone(),
+    );
+    config
+        .env
+        .insert("VISIBLE_KEY".to_owned(), "sensitive-value".to_owned());
+    let record = manager.spawn_proc_blocking(config).expect("spawn proc");
+    let initial: Value = serde_json::from_str(&eventually_read_to_string(
+        &record.record_path,
+        Duration::from_secs(3),
+    ))
+    .expect("initial record json");
+    assert_eq!(
+        initial.get("status").and_then(Value::as_str),
+        Some("running")
+    );
+    assert_eq!(
+        initial.get("run_id").and_then(Value::as_str),
+        Some("run-from-manager")
+    );
+    let env_keys = initial
+        .get("env_keys")
+        .and_then(Value::as_array)
+        .expect("env keys");
+    assert!(
+        env_keys
+            .iter()
+            .any(|key| key.as_str() == Some("VISIBLE_KEY"))
+    );
+    assert!(!initial.to_string().contains("sensitive-value"));
+    assert!(!initial.to_string().contains("secret-from-manager"));
+
+    let exited = manager
+        .wait_shell_blocking(&record.id, Duration::from_secs(3))
+        .expect("wait shell")
+        .expect("shell record");
+    assert_eq!(exited.status, FerrousNativeShellStatus::Exited);
+    let persisted: Value = serde_json::from_str(&eventually_read_to_string(
+        &record.record_path,
+        Duration::from_secs(3),
+    ))
+    .expect("exited record json");
+    assert_eq!(
+        persisted.get("status").and_then(Value::as_str),
+        Some("exited")
+    );
+    assert_eq!(persisted.get("exit_code").and_then(Value::as_i64), Some(0));
 }
 
 #[test]
@@ -432,4 +565,15 @@ fn percentile(sorted: &[f64], q: f64) -> f64 {
     let upper = usize::min(lower + 1, sorted.len() - 1);
     let weight = position - lower as f64;
     sorted[lower] * (1.0 - weight) + sorted[upper] * weight
+}
+
+fn eventually_read_to_string(path: &PathBuf, timeout: Duration) -> String {
+    let started = Instant::now();
+    loop {
+        let content = fs::read_to_string(path).unwrap_or_default();
+        if !content.is_empty() || started.elapsed() >= timeout {
+            return content;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }

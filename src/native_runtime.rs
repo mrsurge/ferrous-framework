@@ -5,9 +5,11 @@ use nix::{
     pty::openpty,
     unistd::dup,
 };
+use serde::Serialize;
 use std::{
     collections::HashMap,
-    fs::{File, OpenOptions, create_dir_all},
+    env,
+    fs::{File, OpenOptions, create_dir_all, rename},
     io::{BufWriter, Read, Write},
     os::fd::{AsFd, AsRawFd, BorrowedFd},
     path::PathBuf,
@@ -17,13 +19,14 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum FerrousNativeShellStatus {
     Running,
     Exited,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct FerrousNativeShellCapabilities {
     pub stdin_write: bool,
     pub stdout_log: bool,
@@ -44,11 +47,21 @@ pub struct FerrousNativeShellRecord {
     pub label: String,
     pub spec_id: String,
     pub subgroups: Vec<String>,
+    pub record_path: PathBuf,
     pub stdout_log: PathBuf,
     pub stderr_log: PathBuf,
     pub capabilities: FerrousNativeShellCapabilities,
     pub created_at_ms: u128,
     pub updated_at_ms: u128,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FerrousNativeEnv {
+    pub secret: String,
+    pub run_id: String,
+    pub fws_socketio_url: Option<String>,
+    pub te_framework_url: Option<String>,
+    pub extra: HashMap<String, String>,
 }
 
 #[derive(Clone, Debug)]
@@ -84,9 +97,10 @@ pub struct FerrousNativePtyConfig {
     pub log_dir: PathBuf,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct FerrousNativeManager {
     state: Arc<Mutex<ManagerState>>,
+    native_env: FerrousNativeEnv,
 }
 
 #[derive(Default)]
@@ -97,9 +111,34 @@ struct ManagerState {
 
 struct NativeShellEntry {
     record: FerrousNativeShellRecord,
+    record_path: PathBuf,
     child: Arc<Mutex<Child>>,
     input: Option<Arc<Mutex<Box<dyn Write + Send>>>>,
     output: Option<Arc<Mutex<DirectOutput>>>,
+}
+
+#[derive(Serialize)]
+struct PersistedNativeShellRecord<'a> {
+    id: &'a str,
+    spec_id: &'a str,
+    backend: &'a str,
+    command: &'a [String],
+    cwd: Option<String>,
+    pid: u32,
+    status: &'a FerrousNativeShellStatus,
+    exit_code: Option<i32>,
+    label: &'a str,
+    subgroups: &'a [String],
+    record_path: String,
+    stdout_log: String,
+    stderr_log: String,
+    io_metadata_log: Option<String>,
+    created_at_ms: u128,
+    updated_at_ms: u128,
+    run_id: Option<&'a str>,
+    launcher_pid: u32,
+    env_keys: Vec<String>,
+    capabilities: &'a FerrousNativeShellCapabilities,
 }
 
 struct DirectOutput {
@@ -113,7 +152,22 @@ impl<T: Read + AsRawFd + Send> ReadAsFd for T {}
 
 impl FerrousNativeManager {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_env(FerrousNativeEnv::from_process_env())
+    }
+
+    pub fn with_env(native_env: FerrousNativeEnv) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(ManagerState::default())),
+            native_env,
+        }
+    }
+
+    pub fn native_env(&self) -> FerrousNativeEnv {
+        self.native_env.clone()
+    }
+
+    pub fn child_env_overlay(&self) -> HashMap<String, String> {
+        self.native_env.child_env_overlay()
     }
 
     pub fn spawn_proc_blocking(
@@ -130,17 +184,19 @@ impl FerrousNativeManager {
         let id = self.next_shell_id()?;
         let stdout_log = config.log_dir.join(format!("{id}.stdout.log"));
         let stderr_log = config.log_dir.join(format!("{id}.stderr.log"));
+        let record_path = record_path_for(&config.log_dir, &id);
         let stdout_file = File::create(&stdout_log)
             .with_context(|| format!("failed to create stdout log {}", stdout_log.display()))?;
         let stderr_file = File::create(&stderr_log)
             .with_context(|| format!("failed to create stderr log {}", stderr_log.display()))?;
+        let child_env = self.merged_child_env(config.env);
 
         let mut command = Command::new(&config.command[0]);
         command.args(&config.command[1..]);
         if let Some(cwd) = &config.cwd {
             command.current_dir(cwd);
         }
-        command.envs(&config.env);
+        command.envs(&child_env);
         command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -163,13 +219,14 @@ impl FerrousNativeManager {
             backend: "proc".to_owned(),
             command: config.command,
             cwd: config.cwd,
-            env: config.env,
+            env: child_env,
             pid,
             status: FerrousNativeShellStatus::Running,
             exit_code: None,
             label: config.label,
             spec_id: config.spec_id,
             subgroups: config.subgroups,
+            record_path: record_path.clone(),
             stdout_log,
             stderr_log,
             capabilities: FerrousNativeShellCapabilities {
@@ -181,8 +238,16 @@ impl FerrousNativeManager {
             created_at_ms: now,
             updated_at_ms: now,
         };
+        persist_record(&record, &record_path)?;
         let child = Arc::new(Mutex::new(child));
-        self.insert_entry(id.clone(), record.clone(), Arc::clone(&child), None, None)?;
+        self.insert_entry(
+            id.clone(),
+            record.clone(),
+            record_path,
+            Arc::clone(&child),
+            None,
+            None,
+        )?;
         spawn_exit_watcher(Arc::clone(&self.state), id, child);
         Ok(record)
     }
@@ -201,16 +266,18 @@ impl FerrousNativeManager {
         let id = self.next_shell_id()?;
         let stdout_log = config.log_dir.join(format!("{id}.stdout.log"));
         let stderr_log = config.log_dir.join(format!("{id}.stderr.log"));
+        let record_path = record_path_for(&config.log_dir, &id);
         let stdout_file = open_log(&stdout_log)?;
         let stderr_file = File::create(&stderr_log)
             .with_context(|| format!("failed to create stderr log {}", stderr_log.display()))?;
+        let child_env = self.merged_child_env(config.env);
 
         let mut command = Command::new(&config.command[0]);
         command.args(&config.command[1..]);
         if let Some(cwd) = &config.cwd {
             command.current_dir(cwd);
         }
-        command.envs(&config.env);
+        command.envs(&child_env);
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -241,13 +308,14 @@ impl FerrousNativeManager {
             backend: "pipe".to_owned(),
             command: config.command,
             cwd: config.cwd,
-            env: config.env,
+            env: child_env,
             pid,
             status: FerrousNativeShellStatus::Running,
             exit_code: None,
             label: config.label,
             spec_id: config.spec_id,
             subgroups: config.subgroups,
+            record_path: record_path.clone(),
             stdout_log,
             stderr_log,
             capabilities: FerrousNativeShellCapabilities {
@@ -259,10 +327,12 @@ impl FerrousNativeManager {
             created_at_ms: now,
             updated_at_ms: now,
         };
+        persist_record(&record, &record_path)?;
         let child = Arc::new(Mutex::new(child));
         self.insert_entry(
             id.clone(),
             record.clone(),
+            record_path,
             Arc::clone(&child),
             input,
             output,
@@ -285,6 +355,7 @@ impl FerrousNativeManager {
         let id = self.next_shell_id()?;
         let stdout_log = config.log_dir.join(format!("{id}.stdout.log"));
         let stderr_log = config.log_dir.join(format!("{id}.stderr.log"));
+        let record_path = record_path_for(&config.log_dir, &id);
         let stdout_file = open_log(&stdout_log)?;
         File::create(&stderr_log)
             .with_context(|| format!("failed to create stderr log {}", stderr_log.display()))?;
@@ -296,13 +367,14 @@ impl FerrousNativeManager {
         let master_input = dup(&pty.master).context("failed to duplicate PTY master input")?;
         let master_output = File::from(pty.master);
         set_nonblocking(&master_output)?;
+        let child_env = self.merged_child_env(config.env);
 
         let mut command = Command::new(&config.command[0]);
         command.args(&config.command[1..]);
         if let Some(cwd) = &config.cwd {
             command.current_dir(cwd);
         }
-        command.envs(&config.env);
+        command.envs(&child_env);
         command
             .stdin(Stdio::from(File::from(slave_stdin)))
             .stdout(Stdio::from(File::from(slave_stdout)))
@@ -324,13 +396,14 @@ impl FerrousNativeManager {
             backend: "pty".to_owned(),
             command: config.command,
             cwd: config.cwd,
-            env: config.env,
+            env: child_env,
             pid,
             status: FerrousNativeShellStatus::Running,
             exit_code: None,
             label: config.label,
             spec_id: config.spec_id,
             subgroups: config.subgroups,
+            record_path: record_path.clone(),
             stdout_log,
             stderr_log,
             capabilities: FerrousNativeShellCapabilities {
@@ -342,10 +415,12 @@ impl FerrousNativeManager {
             created_at_ms: now,
             updated_at_ms: now,
         };
+        persist_record(&record, &record_path)?;
         let child = Arc::new(Mutex::new(child));
         self.insert_entry(
             id.clone(),
             record.clone(),
+            record_path,
             Arc::clone(&child),
             input,
             output,
@@ -475,6 +550,7 @@ impl FerrousNativeManager {
         &self,
         id: String,
         record: FerrousNativeShellRecord,
+        record_path: PathBuf,
         child: Arc<Mutex<Child>>,
         input: Option<Arc<Mutex<Box<dyn Write + Send>>>>,
         output: Option<Arc<Mutex<DirectOutput>>>,
@@ -484,6 +560,7 @@ impl FerrousNativeManager {
             id,
             NativeShellEntry {
                 record,
+                record_path,
                 child,
                 input,
                 output,
@@ -498,10 +575,47 @@ impl FerrousNativeManager {
         Ok(format!("frs_{}_{}", now_ms(), state.next_id))
     }
 
+    fn merged_child_env(&self, explicit_env: HashMap<String, String>) -> HashMap<String, String> {
+        let mut env = self.child_env_overlay();
+        env.extend(explicit_env);
+        env
+    }
+
     fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, ManagerState>> {
         self.state
             .lock()
             .map_err(|_| anyhow!("native manager lock poisoned"))
+    }
+}
+
+impl Default for FerrousNativeManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FerrousNativeEnv {
+    pub fn from_process_env() -> Self {
+        Self {
+            secret: read_env_or_else("FRAMEWORK_SHELLS_SECRET", generate_secret),
+            run_id: read_env_or_else("FRAMEWORK_SHELLS_RUN_ID", generate_run_id),
+            fws_socketio_url: nonempty_env("FRAMEWORK_SHELLS_FWS_SOCKETIO_URL"),
+            te_framework_url: nonempty_env("TE_FRAMEWORK_URL"),
+            extra: HashMap::new(),
+        }
+    }
+
+    pub fn child_env_overlay(&self) -> HashMap<String, String> {
+        let mut out = self.extra.clone();
+        out.insert("FRAMEWORK_SHELLS_SECRET".to_owned(), self.secret.clone());
+        out.insert("FRAMEWORK_SHELLS_RUN_ID".to_owned(), self.run_id.clone());
+        if let Some(url) = &self.fws_socketio_url {
+            out.insert("FRAMEWORK_SHELLS_FWS_SOCKETIO_URL".to_owned(), url.clone());
+        }
+        if let Some(url) = &self.te_framework_url {
+            out.insert("TE_FRAMEWORK_URL".to_owned(), url.clone());
+        }
+        out
     }
 }
 
@@ -575,6 +689,61 @@ fn open_log(path: &PathBuf) -> Result<File> {
         .with_context(|| format!("failed to create log {}", path.display()))
 }
 
+fn record_path_for(log_dir: &std::path::Path, shell_id: &str) -> PathBuf {
+    log_dir.join(format!("{shell_id}.record.json"))
+}
+
+fn persist_record(record: &FerrousNativeShellRecord, path: &std::path::Path) -> Result<()> {
+    let persisted = PersistedNativeShellRecord {
+        id: &record.id,
+        spec_id: &record.spec_id,
+        backend: &record.backend,
+        command: &record.command,
+        cwd: record.cwd.as_ref().map(path_to_string),
+        pid: record.pid,
+        status: &record.status,
+        exit_code: record.exit_code,
+        label: &record.label,
+        subgroups: &record.subgroups,
+        record_path: path_to_string(&record.record_path),
+        stdout_log: path_to_string(&record.stdout_log),
+        stderr_log: path_to_string(&record.stderr_log),
+        io_metadata_log: None,
+        created_at_ms: record.created_at_ms,
+        updated_at_ms: record.updated_at_ms,
+        run_id: record
+            .env
+            .get("FRAMEWORK_SHELLS_RUN_ID")
+            .map(String::as_str),
+        launcher_pid: std::process::id(),
+        env_keys: sorted_env_keys(&record.env),
+        capabilities: &record.capabilities,
+    };
+    let tmp_path = path.with_extension("record.json.tmp");
+    let file = File::create(&tmp_path)
+        .with_context(|| format!("failed to create record {}", tmp_path.display()))?;
+    serde_json::to_writer_pretty(file, &persisted)
+        .with_context(|| format!("failed to write record {}", tmp_path.display()))?;
+    rename(&tmp_path, path).with_context(|| {
+        format!(
+            "failed to install record {} -> {}",
+            tmp_path.display(),
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn path_to_string(path: &std::path::PathBuf) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+fn sorted_env_keys(env: &HashMap<String, String>) -> Vec<String> {
+    let mut keys = env.keys().cloned().collect::<Vec<_>>();
+    keys.sort();
+    keys
+}
+
 fn set_nonblocking(fd: &impl AsFd) -> Result<()> {
     let flags = OFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFL)?);
     fcntl(fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
@@ -586,6 +755,37 @@ fn validate_command(command: &[String], backend: &str) -> Result<()> {
         bail!("{backend} command cannot be empty");
     }
     Ok(())
+}
+
+fn nonempty_env(name: &str) -> Option<String> {
+    env::var(name)
+        .ok()
+        .and_then(|value| (!value.is_empty()).then_some(value))
+}
+
+fn read_env_or_else(name: &str, fallback: impl FnOnce() -> String) -> String {
+    nonempty_env(name).unwrap_or_else(fallback)
+}
+
+fn generate_secret() -> String {
+    let mut bytes = [0_u8; 16];
+    if getrandom::fill(&mut bytes).is_ok() {
+        return format!("ferrous_secret_{}", hex_bytes(&bytes));
+    }
+    format!("ferrous_secret_{}_{}", std::process::id(), now_ms())
+}
+
+fn generate_run_id() -> String {
+    format!("ferrous_run_{}_{}", now_ms(), std::process::id())
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 fn take_line(buffer: &mut Vec<u8>) -> Option<String> {
@@ -641,6 +841,7 @@ fn spawn_exit_watcher(state: Arc<Mutex<ManagerState>>, shell_id: String, child: 
                         entry.record.status = FerrousNativeShellStatus::Exited;
                         entry.record.exit_code = Some(exit_code);
                         entry.record.updated_at_ms = now_ms();
+                        let _ = persist_record(&entry.record, &entry.record_path);
                     }
                 }
                 return;

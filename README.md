@@ -18,6 +18,7 @@ Rust application
 Current native API:
 
 - `FerrousNativeManager`
+- `FerrousNativeEnv`
 - `FerrousNativeProcConfig`
 - `FerrousNativePipeConfig`
 - `FerrousNativePtyConfig`
@@ -35,13 +36,34 @@ pty: launch, direct PTY writes, direct PTY reads, PTY output log, list/get, term
 
 The `pipe` and `pty` hot paths are direct fd paths. They do not use a Python bridge, a stdout pump queue, or a drain worker. Reads are caller-driven and tee output to the log as bytes are read.
 
+Each native launch writes a sidecar record at `FerrousNativeShellRecord.record_path`, next to the stdout/stderr logs. The sidecar records command/backend/status/log paths/capabilities/run metadata and env keys, but does not persist env values or secrets.
+
+## FWS Environment Contract
+
+`FerrousNativeManager::new()` derives the FWS child environment from the current process:
+
+- `FRAMEWORK_SHELLS_SECRET`
+- `FRAMEWORK_SHELLS_RUN_ID`
+- `FRAMEWORK_SHELLS_FWS_SOCKETIO_URL`
+- `TE_FRAMEWORK_URL`
+
+If `FRAMEWORK_SHELLS_SECRET` or `FRAMEWORK_SHELLS_RUN_ID` is absent, Ferrous generates native defaults. URL values are optional until a host/dashboard runtime is attached.
+
+For explicit host control, construct the manager with `FerrousNativeManager::with_env(FerrousNativeEnv { ... })`. Every native `proc`, `pipe`, and `pty` spawn receives that overlay, then the shell config `env` is applied last so shell-specific overrides still work.
+
 ## Example
 
 ```rust
-use ferrous_framework::{FerrousNativeManager, FerrousNativePipeConfig};
+use ferrous_framework::{FerrousNativeEnv, FerrousNativeManager, FerrousNativePipeConfig};
 use std::{collections::HashMap, path::PathBuf, time::Duration};
 
-let manager = FerrousNativeManager::new();
+let manager = FerrousNativeManager::with_env(FerrousNativeEnv {
+    secret: "dev-secret".into(),
+    run_id: "dev-run".into(),
+    fws_socketio_url: Some("http://127.0.0.1:9099/fws_ws".into()),
+    te_framework_url: Some("http://127.0.0.1:9099".into()),
+    extra: HashMap::new(),
+});
 let shell = manager.spawn_pipe_blocking(FerrousNativePipeConfig {
     command: vec!["sh".into(), "-c".into(), "while read line; do echo ack:$line; done".into()],
     cwd: None,
