@@ -65,6 +65,10 @@ fn jsonrpc_echo_command() -> Vec<String> {
     vec![env!("CARGO_BIN_EXE_ferrous-jsonrpc-echo").to_owned()]
 }
 
+fn tcp_ready_command() -> String {
+    env!("CARGO_BIN_EXE_ferrous-tcp-ready").to_owned()
+}
+
 fn test_native_env() -> FerrousNativeEnv {
     FerrousNativeEnv {
         secret: "secret-from-manager".to_owned(),
@@ -407,6 +411,65 @@ fn shellspec_entry_rejects_autostart_false() {
         .spawn_shellspec_entry_blocking(&document, "disabled", &ShellspecRenderInput::default())
         .expect_err("autostart false should not launch");
     assert!(error.to_string().contains("autostart=false"));
+}
+
+#[test]
+fn shellspec_entry_waits_for_stdout_regex_readiness() {
+    let manager = test_manager_with_store("shellspec-stdout-readiness");
+    let document = json!({
+        "version": "1",
+        "shells": {
+            "worker": {
+                "backend": "proc",
+                "command": ["sh", "-c", "sleep 0.1; printf 'service READY'; sleep 0.2"],
+                "readiness": {
+                    "type": "stdout_regex",
+                    "pattern": "READY",
+                    "timeout": 2
+                }
+            }
+        }
+    });
+    let record = manager
+        .spawn_shellspec_entry_blocking(&document, "worker", &ShellspecRenderInput::default())
+        .expect("spawn shellspec proc with stdout readiness");
+    assert_eq!(record.backend, "proc");
+    assert_eq!(
+        eventually_read_to_string(&record.stdout_log, Duration::from_secs(3)),
+        "service READY"
+    );
+}
+
+#[test]
+fn shellspec_entry_waits_for_tcp_port_readiness() {
+    let manager = test_manager_with_store("shellspec-tcp-readiness");
+    let helper = tcp_ready_command();
+    let document = json!({
+        "version": "1",
+        "shells": {
+            "tcp_worker": {
+                "backend": "proc",
+                "command": [helper, "${free_port}"],
+                "env": {
+                    "PORT": "${free_port}"
+                },
+                "readiness": {
+                    "type": "tcp_port",
+                    "host": "127.0.0.1",
+                    "port": "${free_port}",
+                    "timeout": 2
+                }
+            }
+        }
+    });
+    let record = manager
+        .spawn_shellspec_entry_blocking(&document, "tcp_worker", &ShellspecRenderInput::default())
+        .expect("spawn shellspec proc with tcp readiness");
+    assert_eq!(record.backend, "proc");
+    assert_eq!(
+        record.command.get(1).map(String::as_str),
+        record.env.get("PORT").map(String::as_str)
+    );
 }
 
 #[test]

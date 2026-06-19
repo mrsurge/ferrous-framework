@@ -1,4 +1,6 @@
-use crate::shellspec::{RenderedShellSpec, ShellspecRenderInput, render_shellspec_entry};
+use crate::shellspec::{
+    RenderedReadinessProbe, RenderedShellSpec, ShellspecRenderInput, render_shellspec_entry,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use nix::{
     fcntl::{FcntlArg, OFlag, fcntl},
@@ -6,6 +8,7 @@ use nix::{
     pty::openpty,
     unistd::dup,
 };
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -14,6 +17,7 @@ use std::{
     env,
     fs::{File, OpenOptions, create_dir_all, read_dir, read_to_string, rename},
     io::{BufWriter, Read, Write},
+    net::{TcpStream, ToSocketAddrs},
     os::fd::{AsFd, AsRawFd, BorrowedFd},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -227,7 +231,8 @@ impl FerrousNativeManager {
         if !spec.autostart {
             bail!("shellspec '{}' has autostart=false", spec.id);
         }
-        match spec.backend.as_str() {
+        let readiness = spec.readiness.clone();
+        let record = match spec.backend.as_str() {
             "proc" => self.spawn_proc_blocking(FerrousNativeProcConfig {
                 command: spec.command,
                 cwd: spec.cwd,
@@ -256,7 +261,18 @@ impl FerrousNativeManager {
                 log_dir: None,
             }),
             backend => bail!("unsupported native shellspec backend '{backend}'"),
+        }?;
+        if let Some(probe) = readiness {
+            if !wait_for_readiness_blocking(&record, &probe)? {
+                let _ = self.terminate_shell_blocking(&record.id);
+                bail!(
+                    "shellspec '{}' failed readiness ({})",
+                    record.spec_id,
+                    probe.probe_type
+                );
+            }
         }
+        Ok(record)
     }
 
     pub fn spawn_proc_blocking(
@@ -1014,6 +1030,70 @@ fn validate_command(command: &[String], backend: &str) -> Result<()> {
     Ok(())
 }
 
+fn wait_for_readiness_blocking(
+    record: &FerrousNativeShellRecord,
+    probe: &RenderedReadinessProbe,
+) -> Result<bool> {
+    match probe.probe_type.as_str() {
+        "tcp_port" => wait_for_tcp_port(probe),
+        "stdout_regex" => wait_for_stdout_regex(record, probe),
+        other => bail!("unsupported readiness probe '{other}'"),
+    }
+}
+
+fn wait_for_tcp_port(probe: &RenderedReadinessProbe) -> Result<bool> {
+    let Some(port) = probe.port else {
+        return Ok(false);
+    };
+    let deadline = Instant::now() + readiness_timeout(probe);
+    let address = format!("{}:{port}", probe.host);
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let connect_timeout = remaining.min(Duration::from_millis(200));
+        let addrs = address
+            .to_socket_addrs()
+            .with_context(|| format!("failed to resolve readiness address {address}"))?
+            .collect::<Vec<_>>();
+        for addr in addrs {
+            if TcpStream::connect_timeout(&addr, connect_timeout).is_ok() {
+                return Ok(true);
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Ok(false)
+}
+
+fn wait_for_stdout_regex(
+    record: &FerrousNativeShellRecord,
+    probe: &RenderedReadinessProbe,
+) -> Result<bool> {
+    let Some(pattern) = &probe.pattern else {
+        return Ok(false);
+    };
+    let regex =
+        Regex::new(pattern).with_context(|| format!("invalid readiness regex {pattern:?}"))?;
+    let deadline = Instant::now() + readiness_timeout(probe);
+    while Instant::now() < deadline {
+        match read_to_string(&record.stdout_log) {
+            Ok(content) if regex.is_match(&content) => return Ok(true),
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Ok(false)
+}
+
+fn readiness_timeout(probe: &RenderedReadinessProbe) -> Duration {
+    if probe.timeout_seconds.is_finite() && probe.timeout_seconds > 0.0 {
+        Duration::from_secs_f64(probe.timeout_seconds)
+    } else {
+        Duration::from_secs(30)
+    }
+}
+
 fn fws_base_dir() -> Result<PathBuf> {
     let base = match nonempty_env("FRAMEWORK_SHELLS_BASE_DIR") {
         Some(raw) => expand_user(PathBuf::from(raw))?,
@@ -1187,6 +1267,9 @@ fn spawn_log_thread(mut reader: impl Read + Send + 'static, file: File) {
                 }
                 Ok(n) => {
                     if file.write_all(&buffer[..n]).is_err() {
+                        return;
+                    }
+                    if file.flush().is_err() {
                         return;
                     }
                 }

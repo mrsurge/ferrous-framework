@@ -8,7 +8,7 @@ pub struct ShellspecRenderInput {
     pub env: HashMap<String, String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RenderedShellSpec {
     pub id: String,
     pub backend: String,
@@ -18,6 +18,18 @@ pub struct RenderedShellSpec {
     pub subgroups: Vec<String>,
     pub pty_mode: String,
     pub autostart: bool,
+    pub readiness: Option<RenderedReadinessProbe>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RenderedReadinessProbe {
+    pub probe_type: String,
+    pub timeout_seconds: f64,
+    pub pattern: Option<String>,
+    pub host: String,
+    pub port: Option<u16>,
+    pub url: Option<String>,
+    pub status_codes: Vec<u16>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -75,6 +87,7 @@ pub fn parse_shellspec_entry(document: &Value, entry: &str) -> Result<RenderedSh
         .get("autostart")
         .and_then(Value::as_bool)
         .unwrap_or(true);
+    let readiness = parse_readiness_value(shell.get("readiness"), &id)?;
     Ok(RenderedShellSpec {
         id,
         backend,
@@ -84,6 +97,7 @@ pub fn parse_shellspec_entry(document: &Value, entry: &str) -> Result<RenderedSh
         subgroups,
         pty_mode,
         autostart,
+        readiness,
     })
 }
 
@@ -166,6 +180,67 @@ fn parse_string_list(value: Option<&Value>) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn parse_readiness_value(
+    value: Option<&Value>,
+    id: &str,
+) -> Result<Option<RenderedReadinessProbe>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let Some(object) = value.as_object() else {
+        bail!("shellspec '{id}' readiness must be an object");
+    };
+    let probe_type = object
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    if probe_type.is_empty() {
+        bail!("shellspec '{id}' readiness.type is required");
+    }
+    Ok(Some(RenderedReadinessProbe {
+        probe_type,
+        timeout_seconds: parse_f64(object.get("timeout")).unwrap_or(30.0),
+        pattern: object
+            .get("pattern")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        host: object
+            .get("host")
+            .and_then(Value::as_str)
+            .unwrap_or("127.0.0.1")
+            .to_owned(),
+        port: parse_u16(object.get("port")),
+        url: object.get("url").and_then(Value::as_str).map(str::to_owned),
+        status_codes: object
+            .get("status_codes")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| parse_u16(Some(item)))
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![200]),
+    }))
+}
+
+fn parse_f64(value: Option<&Value>) -> Option<f64> {
+    match value {
+        Some(Value::Number(number)) => number.as_f64(),
+        Some(Value::String(raw)) => raw.parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+fn parse_u16(value: Option<&Value>) -> Option<u16> {
+    match value {
+        Some(Value::Number(number)) => number.as_u64().and_then(|raw| u16::try_from(raw).ok()),
+        Some(Value::String(raw)) => raw.trim().parse::<u16>().ok(),
+        _ => None,
+    }
 }
 
 fn render_string(
