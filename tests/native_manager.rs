@@ -1,6 +1,6 @@
 use ferrous_framework::{
     FerrousNativeEnv, FerrousNativeManager, FerrousNativePipeConfig, FerrousNativeProcConfig,
-    FerrousNativePtyConfig, FerrousNativeShellStatus,
+    FerrousNativePtyConfig, FerrousNativeShellStatus, FerrousNativeStore,
 };
 use serde_json::Value;
 use std::{
@@ -32,7 +32,7 @@ fn base_proc_config(command: Vec<String>, log_dir: PathBuf) -> FerrousNativeProc
         label: "native-proc-test".to_owned(),
         spec_id: "native-proc-test".to_owned(),
         subgroups: vec!["tests".to_owned()],
-        log_dir,
+        log_dir: Some(log_dir),
     }
 }
 
@@ -44,7 +44,7 @@ fn base_pipe_config(command: Vec<String>, log_dir: PathBuf) -> FerrousNativePipe
         label: "native-pipe-test".to_owned(),
         spec_id: "native-pipe-test".to_owned(),
         subgroups: vec!["tests".to_owned()],
-        log_dir,
+        log_dir: Some(log_dir),
     }
 }
 
@@ -56,7 +56,7 @@ fn base_pty_config(command: Vec<String>, log_dir: PathBuf) -> FerrousNativePtyCo
         label: "native-pty-test".to_owned(),
         spec_id: "native-pty-test".to_owned(),
         subgroups: vec!["tests".to_owned()],
-        log_dir,
+        log_dir: Some(log_dir),
     }
 }
 
@@ -72,6 +72,35 @@ fn test_native_env() -> FerrousNativeEnv {
         te_framework_url: Some("http://127.0.0.1:19099".to_owned()),
         extra: HashMap::from([("FERROUS_EXTRA".to_owned(), "extra-from-manager".to_owned())]),
     }
+}
+
+fn test_manager_with_store(name: &str) -> FerrousNativeManager {
+    let base_dir = test_log_dir(name).join("fws-base");
+    let secret = format!("secret-for-{name}");
+    let store = FerrousNativeStore::from_base_dir_fingerprint_secret(
+        base_dir,
+        "test_fingerprint".to_owned(),
+        secret.clone(),
+    )
+    .expect("test native store");
+    let env = FerrousNativeEnv {
+        secret,
+        run_id: format!("run-for-{name}"),
+        fws_socketio_url: None,
+        te_framework_url: None,
+        extra: HashMap::new(),
+    };
+    FerrousNativeManager::with_store_and_env(store, env)
+}
+
+fn test_manager_with_native_env(name: &str, env: FerrousNativeEnv) -> FerrousNativeManager {
+    let store = FerrousNativeStore::from_base_dir_fingerprint_secret(
+        test_log_dir(name).join("fws-base"),
+        "test_fingerprint".to_owned(),
+        env.secret.clone(),
+    )
+    .expect("test native store");
+    FerrousNativeManager::with_store_and_env(store, env)
 }
 
 #[test]
@@ -114,7 +143,7 @@ fn spawns_proc_and_captures_stdout_stderr_logs() {
 
 #[test]
 fn native_env_overlay_reaches_proc_children() {
-    let manager = FerrousNativeManager::with_env(test_native_env());
+    let manager = test_manager_with_native_env("proc-native-env-store", test_native_env());
     let log_dir = test_log_dir("proc-native-env");
     let mut config = base_proc_config(
         vec![
@@ -149,7 +178,7 @@ fn native_env_overlay_reaches_proc_children() {
 
 #[test]
 fn native_env_overlay_reaches_pipe_children() {
-    let manager = FerrousNativeManager::with_env(test_native_env());
+    let manager = test_manager_with_native_env("pipe-native-env-store", test_native_env());
     let log_dir = test_log_dir("pipe-native-env");
     let record = manager
         .spawn_pipe_blocking(base_pipe_config(
@@ -179,7 +208,7 @@ fn native_env_overlay_reaches_pipe_children() {
 
 #[test]
 fn native_record_sidecar_is_persisted_without_env_values() {
-    let manager = FerrousNativeManager::with_env(test_native_env());
+    let manager = test_manager_with_native_env("record-sidecar-store", test_native_env());
     let log_dir = test_log_dir("record-sidecar");
     let mut config = base_proc_config(
         vec![
@@ -233,6 +262,43 @@ fn native_record_sidecar_is_persisted_without_env_values() {
         Some("exited")
     );
     assert_eq!(persisted.get("exit_code").and_then(Value::as_i64), Some(0));
+}
+
+#[test]
+fn omitted_log_dir_uses_fws_runtime_store_logs_dir() {
+    let manager = test_manager_with_store("default-log-dir");
+    let store = manager.store();
+    assert_eq!(store.repo_fingerprint, "test_fingerprint");
+    assert!(
+        store
+            .secret_file
+            .ends_with("runtimes/test_fingerprint/secret")
+    );
+    assert_eq!(
+        fs::read_to_string(&store.secret_file).expect("stored secret"),
+        "secret-for-default-log-dir"
+    );
+    assert_eq!(store.logs_dir, store.root.join("logs"));
+    let mut config = base_proc_config(
+        vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "printf default-log-dir".to_owned(),
+        ],
+        test_log_dir("unused-explicit-log-dir"),
+    );
+    config.log_dir = None;
+    let record = manager.spawn_proc_blocking(config).expect("spawn proc");
+
+    assert!(record.record_path.starts_with(&store.logs_dir));
+    assert!(record.stdout_log.starts_with(&store.logs_dir));
+    assert!(record.stderr_log.starts_with(&store.logs_dir));
+
+    let exited = manager
+        .wait_shell_blocking(&record.id, Duration::from_secs(3))
+        .expect("wait shell")
+        .expect("shell record");
+    assert_eq!(exited.status, FerrousNativeShellStatus::Exited);
 }
 
 #[test]

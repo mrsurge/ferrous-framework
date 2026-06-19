@@ -5,6 +5,6 @@ pub mod shutdown;
 pub use native_runtime::{
     FerrousNativeEnv, FerrousNativeManager, FerrousNativePipeConfig, FerrousNativeProcConfig,
     FerrousNativePtyConfig, FerrousNativeShellCapabilities, FerrousNativeShellRecord,
-    FerrousNativeShellStatus,
+    FerrousNativeShellStatus, FerrousNativeStore,
 };
 pub use shutdown::{FerrousShutdownResult, FerrousShutdownStats};

@@ -6,10 +6,11 @@ use nix::{
     unistd::dup,
 };
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     env,
-    fs::{File, OpenOptions, create_dir_all, rename},
+    fs::{File, OpenOptions, create_dir_all, read_to_string, rename},
     io::{BufWriter, Read, Write},
     os::fd::{AsFd, AsRawFd, BorrowedFd},
     path::PathBuf,
@@ -64,6 +65,19 @@ pub struct FerrousNativeEnv {
     pub extra: HashMap<String, String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FerrousNativeStore {
+    pub secret: String,
+    pub runtime_id: String,
+    pub repo_fingerprint: String,
+    pub base_dir: PathBuf,
+    pub root: PathBuf,
+    pub metadata_dir: PathBuf,
+    pub logs_dir: PathBuf,
+    pub sockets_dir: PathBuf,
+    pub secret_file: PathBuf,
+}
+
 #[derive(Clone, Debug)]
 pub struct FerrousNativeProcConfig {
     pub command: Vec<String>,
@@ -72,7 +86,7 @@ pub struct FerrousNativeProcConfig {
     pub label: String,
     pub spec_id: String,
     pub subgroups: Vec<String>,
-    pub log_dir: PathBuf,
+    pub log_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -83,7 +97,7 @@ pub struct FerrousNativePipeConfig {
     pub label: String,
     pub spec_id: String,
     pub subgroups: Vec<String>,
-    pub log_dir: PathBuf,
+    pub log_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -94,12 +108,13 @@ pub struct FerrousNativePtyConfig {
     pub label: String,
     pub spec_id: String,
     pub subgroups: Vec<String>,
-    pub log_dir: PathBuf,
+    pub log_dir: Option<PathBuf>,
 }
 
 #[derive(Clone)]
 pub struct FerrousNativeManager {
     state: Arc<Mutex<ManagerState>>,
+    store: FerrousNativeStore,
     native_env: FerrousNativeEnv,
 }
 
@@ -152,14 +167,35 @@ impl<T: Read + AsRawFd + Send> ReadAsFd for T {}
 
 impl FerrousNativeManager {
     pub fn new() -> Self {
-        Self::with_env(FerrousNativeEnv::from_process_env())
+        Self::try_new().expect("failed to initialize native FWS store")
+    }
+
+    pub fn try_new() -> Result<Self> {
+        let store = FerrousNativeStore::from_process_env()?;
+        let native_env = FerrousNativeEnv::from_process_env_with_secret(store.secret.clone());
+        Ok(Self::with_store_and_env(store, native_env))
     }
 
     pub fn with_env(native_env: FerrousNativeEnv) -> Self {
+        let store = FerrousNativeStore::from_secret(native_env.secret.clone())
+            .expect("failed to initialize native FWS store");
+        Self::with_store_and_env(store, native_env)
+    }
+
+    pub fn with_store_and_env(store: FerrousNativeStore, native_env: FerrousNativeEnv) -> Self {
         Self {
             state: Arc::new(Mutex::new(ManagerState::default())),
+            store,
             native_env,
         }
+    }
+
+    pub fn store(&self) -> FerrousNativeStore {
+        self.store.clone()
+    }
+
+    pub fn logs_dir(&self) -> PathBuf {
+        self.store.logs_dir.clone()
     }
 
     pub fn native_env(&self) -> FerrousNativeEnv {
@@ -175,16 +211,17 @@ impl FerrousNativeManager {
         config: FerrousNativeProcConfig,
     ) -> Result<FerrousNativeShellRecord> {
         validate_command(&config.command, "native proc")?;
-        create_dir_all(&config.log_dir).with_context(|| {
+        let log_dir = self.resolve_log_dir(config.log_dir)?;
+        create_dir_all(&log_dir).with_context(|| {
             format!(
                 "failed to create native proc log directory {}",
-                config.log_dir.display()
+                log_dir.display()
             )
         })?;
         let id = self.next_shell_id()?;
-        let stdout_log = config.log_dir.join(format!("{id}.stdout.log"));
-        let stderr_log = config.log_dir.join(format!("{id}.stderr.log"));
-        let record_path = record_path_for(&config.log_dir, &id);
+        let stdout_log = log_dir.join(format!("{id}.stdout.log"));
+        let stderr_log = log_dir.join(format!("{id}.stderr.log"));
+        let record_path = record_path_for(&log_dir, &id);
         let stdout_file = File::create(&stdout_log)
             .with_context(|| format!("failed to create stdout log {}", stdout_log.display()))?;
         let stderr_file = File::create(&stderr_log)
@@ -257,16 +294,17 @@ impl FerrousNativeManager {
         config: FerrousNativePipeConfig,
     ) -> Result<FerrousNativeShellRecord> {
         validate_command(&config.command, "native pipe")?;
-        create_dir_all(&config.log_dir).with_context(|| {
+        let log_dir = self.resolve_log_dir(config.log_dir)?;
+        create_dir_all(&log_dir).with_context(|| {
             format!(
                 "failed to create native pipe log directory {}",
-                config.log_dir.display()
+                log_dir.display()
             )
         })?;
         let id = self.next_shell_id()?;
-        let stdout_log = config.log_dir.join(format!("{id}.stdout.log"));
-        let stderr_log = config.log_dir.join(format!("{id}.stderr.log"));
-        let record_path = record_path_for(&config.log_dir, &id);
+        let stdout_log = log_dir.join(format!("{id}.stdout.log"));
+        let stderr_log = log_dir.join(format!("{id}.stderr.log"));
+        let record_path = record_path_for(&log_dir, &id);
         let stdout_file = open_log(&stdout_log)?;
         let stderr_file = File::create(&stderr_log)
             .with_context(|| format!("failed to create stderr log {}", stderr_log.display()))?;
@@ -346,16 +384,17 @@ impl FerrousNativeManager {
         config: FerrousNativePtyConfig,
     ) -> Result<FerrousNativeShellRecord> {
         validate_command(&config.command, "native pty")?;
-        create_dir_all(&config.log_dir).with_context(|| {
+        let log_dir = self.resolve_log_dir(config.log_dir)?;
+        create_dir_all(&log_dir).with_context(|| {
             format!(
                 "failed to create native pty log directory {}",
-                config.log_dir.display()
+                log_dir.display()
             )
         })?;
         let id = self.next_shell_id()?;
-        let stdout_log = config.log_dir.join(format!("{id}.stdout.log"));
-        let stderr_log = config.log_dir.join(format!("{id}.stderr.log"));
-        let record_path = record_path_for(&config.log_dir, &id);
+        let stdout_log = log_dir.join(format!("{id}.stdout.log"));
+        let stderr_log = log_dir.join(format!("{id}.stderr.log"));
+        let record_path = record_path_for(&log_dir, &id);
         let stdout_file = open_log(&stdout_log)?;
         File::create(&stderr_log)
             .with_context(|| format!("failed to create stderr log {}", stderr_log.display()))?;
@@ -581,6 +620,13 @@ impl FerrousNativeManager {
         env
     }
 
+    fn resolve_log_dir(&self, log_dir: Option<PathBuf>) -> Result<PathBuf> {
+        Ok(match log_dir {
+            Some(path) => absolutize_path(expand_user(path)?)?,
+            None => self.store.logs_dir.clone(),
+        })
+    }
+
     fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, ManagerState>> {
         self.state
             .lock()
@@ -596,8 +642,15 @@ impl Default for FerrousNativeManager {
 
 impl FerrousNativeEnv {
     pub fn from_process_env() -> Self {
+        Self::from_process_env_with_secret(read_env_or_else(
+            "FRAMEWORK_SHELLS_SECRET",
+            generate_secret,
+        ))
+    }
+
+    pub fn from_process_env_with_secret(secret: String) -> Self {
         Self {
-            secret: read_env_or_else("FRAMEWORK_SHELLS_SECRET", generate_secret),
+            secret,
             run_id: read_env_or_else("FRAMEWORK_SHELLS_RUN_ID", generate_run_id),
             fws_socketio_url: nonempty_env("FRAMEWORK_SHELLS_FWS_SOCKETIO_URL"),
             te_framework_url: nonempty_env("TE_FRAMEWORK_URL"),
@@ -616,6 +669,79 @@ impl FerrousNativeEnv {
             out.insert("TE_FRAMEWORK_URL".to_owned(), url.clone());
         }
         out
+    }
+}
+
+impl FerrousNativeStore {
+    pub fn from_process_env() -> Result<Self> {
+        let base_dir = fws_base_dir()?;
+        let repo_fingerprint = fws_repo_fingerprint()?;
+        let secret = match nonempty_env("FRAMEWORK_SHELLS_SECRET") {
+            Some(secret) => {
+                persist_secret(&base_dir, &repo_fingerprint, &secret)?;
+                secret
+            }
+            None => match load_stored_secret(&base_dir, &repo_fingerprint)? {
+                Some(secret) => secret,
+                None => {
+                    let secret = generate_secret();
+                    persist_secret(&base_dir, &repo_fingerprint, &secret)?;
+                    secret
+                }
+            },
+        };
+        Self::from_base_fingerprint_secret(base_dir, repo_fingerprint, secret)
+    }
+
+    pub fn from_secret(secret: String) -> Result<Self> {
+        let base_dir = fws_base_dir()?;
+        let repo_fingerprint = fws_repo_fingerprint()?;
+        persist_secret(&base_dir, &repo_fingerprint, &secret)?;
+        Self::from_base_fingerprint_secret(base_dir, repo_fingerprint, secret)
+    }
+
+    pub fn from_base_dir_fingerprint_secret(
+        base_dir: PathBuf,
+        repo_fingerprint: String,
+        secret: String,
+    ) -> Result<Self> {
+        let base_dir = absolutize_path(expand_user(base_dir)?)?;
+        persist_secret(&base_dir, &repo_fingerprint, &secret)?;
+        Self::from_base_fingerprint_secret(base_dir, repo_fingerprint, secret)
+    }
+
+    fn from_base_fingerprint_secret(
+        base_dir: PathBuf,
+        repo_fingerprint: String,
+        secret: String,
+    ) -> Result<Self> {
+        let runtime_id = derive_runtime_id(&secret);
+        let root = base_dir
+            .join("runtimes")
+            .join(&repo_fingerprint)
+            .join(&runtime_id);
+        let metadata_dir = root.join("meta");
+        let logs_dir = root.join("logs");
+        let sockets_dir = root.join("sockets");
+        for dir in [&metadata_dir, &logs_dir, &sockets_dir] {
+            create_dir_all(dir)
+                .with_context(|| format!("failed to create FWS store dir {}", dir.display()))?;
+        }
+        let secret_file = base_dir
+            .join("runtimes")
+            .join(&repo_fingerprint)
+            .join("secret");
+        Ok(Self {
+            secret,
+            runtime_id,
+            repo_fingerprint,
+            base_dir,
+            root,
+            metadata_dir,
+            logs_dir,
+            sockets_dir,
+            secret_file,
+        })
     }
 }
 
@@ -757,6 +883,124 @@ fn validate_command(command: &[String], backend: &str) -> Result<()> {
     Ok(())
 }
 
+fn fws_base_dir() -> Result<PathBuf> {
+    let base = match nonempty_env("FRAMEWORK_SHELLS_BASE_DIR") {
+        Some(raw) => expand_user(PathBuf::from(raw))?,
+        None => home_dir()?.join(".cache").join("framework_shells"),
+    };
+    absolutize_path(base)
+}
+
+fn fws_repo_fingerprint() -> Result<String> {
+    if let Some(fingerprint) = nonempty_env("FRAMEWORK_SHELLS_REPO_FINGERPRINT") {
+        return Ok(fingerprint);
+    }
+    let fingerprint = if truthy_env("FRAMEWORK_SHELLS_ALLOW_NO_FINGERPRINT") {
+        "standalone_debug".to_owned()
+    } else {
+        compute_fingerprint_from_cwd()?
+    };
+    // SAFETY: This mirrors Python FWS bootstrap by exporting the computed
+    // fingerprint for later code in the same runtime. Ferrous does this during
+    // manager initialization, before it spawns child worker threads.
+    unsafe {
+        env::set_var("FRAMEWORK_SHELLS_REPO_FINGERPRINT", &fingerprint);
+    }
+    Ok(fingerprint)
+}
+
+fn compute_fingerprint_from_cwd() -> Result<String> {
+    let cwd = env::current_dir().context("failed to read current directory")?;
+    let cwd = absolutize_path(cwd)?;
+    Ok(sha256_hex(cwd.to_string_lossy().as_bytes())[..16].to_owned())
+}
+
+fn load_stored_secret(
+    base_dir: &std::path::Path,
+    repo_fingerprint: &str,
+) -> Result<Option<String>> {
+    let secret_file = secret_file_path(base_dir, repo_fingerprint);
+    if !secret_file.exists() {
+        return Ok(None);
+    }
+    let secret = read_to_string(&secret_file)
+        .with_context(|| format!("failed to read FWS secret {}", secret_file.display()))?
+        .trim()
+        .to_owned();
+    Ok((!secret.is_empty()).then_some(secret))
+}
+
+fn persist_secret(base_dir: &std::path::Path, repo_fingerprint: &str, secret: &str) -> Result<()> {
+    if secret.is_empty() {
+        return Ok(());
+    }
+    let secret_file = secret_file_path(base_dir, repo_fingerprint);
+    if let Some(parent) = secret_file.parent() {
+        create_dir_all(parent)
+            .with_context(|| format!("failed to create FWS secret dir {}", parent.display()))?;
+    }
+    std::fs::write(&secret_file, secret)
+        .with_context(|| format!("failed to write FWS secret {}", secret_file.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&secret_file, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+fn secret_file_path(base_dir: &std::path::Path, repo_fingerprint: &str) -> PathBuf {
+    base_dir
+        .join("runtimes")
+        .join(repo_fingerprint)
+        .join("secret")
+}
+
+fn derive_runtime_id(secret: &str) -> String {
+    sha256_hex(secret.as_bytes())[..16].to_owned()
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    hex_bytes(&digest)
+}
+
+fn home_dir() -> Result<PathBuf> {
+    env::var("HOME")
+        .map(PathBuf::from)
+        .context("HOME is required to resolve FWS base dir")
+}
+
+fn expand_user(path: PathBuf) -> Result<PathBuf> {
+    let raw = path.to_string_lossy();
+    if raw == "~" {
+        return home_dir();
+    }
+    if let Some(rest) = raw.strip_prefix("~/") {
+        return Ok(home_dir()?.join(rest));
+    }
+    Ok(path)
+}
+
+fn absolutize_path(path: PathBuf) -> Result<PathBuf> {
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    Ok(env::current_dir()
+        .context("failed to read current directory")?
+        .join(path))
+}
+
+fn truthy_env(name: &str) -> bool {
+    let Some(raw) = nonempty_env(name) else {
+        return false;
+    };
+    matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "y" | "on"
+    )
+}
+
 fn nonempty_env(name: &str) -> Option<String> {
     env::var(name)
         .ok()
@@ -768,11 +1012,11 @@ fn read_env_or_else(name: &str, fallback: impl FnOnce() -> String) -> String {
 }
 
 fn generate_secret() -> String {
-    let mut bytes = [0_u8; 16];
+    let mut bytes = [0_u8; 8];
     if getrandom::fill(&mut bytes).is_ok() {
-        return format!("ferrous_secret_{}", hex_bytes(&bytes));
+        return format!("temporary_secret_{}", hex_bytes(&bytes));
     }
-    format!("ferrous_secret_{}_{}", std::process::id(), now_ms())
+    format!("temporary_secret_{}_{}", std::process::id(), now_ms())
 }
 
 fn generate_run_id() -> String {
