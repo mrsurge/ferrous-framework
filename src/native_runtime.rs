@@ -22,7 +22,10 @@ use std::{
     os::fd::{AsFd, AsRawFd, BorrowedFd},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        mpsc::{Receiver, Sender, TryRecvError, channel},
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -137,6 +140,7 @@ pub struct FerrousNativePtyConfig {
 #[derive(Clone)]
 pub struct FerrousNativeManager {
     state: Arc<Mutex<ManagerState>>,
+    reactor: NativeRuntimeReactor,
     store: FerrousNativeStore,
     native_env: FerrousNativeEnv,
 }
@@ -188,6 +192,49 @@ struct DirectOutput {
 trait ReadAsFd: Read + AsRawFd + Send {}
 impl<T: Read + AsRawFd + Send> ReadAsFd for T {}
 
+#[derive(Clone)]
+struct NativeRuntimeReactor {
+    tx: Sender<ReactorCommand>,
+}
+
+enum ReactorCommand {
+    RegisterLogStream(ReactorLogStream),
+    WatchChild(ReactorChild),
+}
+
+struct ReactorLogStream {
+    reader: Box<dyn ReadAsFd>,
+    log: BufWriter<File>,
+}
+
+struct ReactorChild {
+    shell_id: String,
+    child: Arc<Mutex<Child>>,
+}
+
+impl NativeRuntimeReactor {
+    fn start(state: Arc<Mutex<ManagerState>>) -> Self {
+        let (tx, rx) = channel::<ReactorCommand>();
+        thread::spawn(move || reactor_loop(state, rx));
+        Self { tx }
+    }
+
+    fn register_log_stream(&self, reader: impl ReadAsFd + 'static, file: File) -> Result<()> {
+        self.tx
+            .send(ReactorCommand::RegisterLogStream(ReactorLogStream {
+                reader: Box::new(reader),
+                log: BufWriter::with_capacity(256 * 1024, file),
+            }))
+            .map_err(|_| anyhow!("native runtime reactor stopped"))
+    }
+
+    fn watch_child(&self, shell_id: String, child: Arc<Mutex<Child>>) -> Result<()> {
+        self.tx
+            .send(ReactorCommand::WatchChild(ReactorChild { shell_id, child }))
+            .map_err(|_| anyhow!("native runtime reactor stopped"))
+    }
+}
+
 impl FerrousNativeManager {
     pub fn new() -> Self {
         Self::try_new().expect("failed to initialize native FWS store")
@@ -206,8 +253,11 @@ impl FerrousNativeManager {
     }
 
     pub fn with_store_and_env(store: FerrousNativeStore, native_env: FerrousNativeEnv) -> Self {
+        let state = Arc::new(Mutex::new(ManagerState::default()));
+        let reactor = NativeRuntimeReactor::start(Arc::clone(&state));
         Self {
-            state: Arc::new(Mutex::new(ManagerState::default())),
+            state,
+            reactor,
             store,
             native_env,
         }
@@ -367,10 +417,12 @@ impl FerrousNativeManager {
             .with_context(|| format!("failed to spawn native proc shell {id}"))?;
         let pid = child.id();
         if let Some(stdout) = child.stdout.take() {
-            spawn_log_thread(stdout, stdout_file);
+            set_nonblocking(&stdout)?;
+            self.reactor.register_log_stream(stdout, stdout_file)?;
         }
         if let Some(stderr) = child.stderr.take() {
-            spawn_log_thread(stderr, stderr_file);
+            set_nonblocking(&stderr)?;
+            self.reactor.register_log_stream(stderr, stderr_file)?;
         }
 
         let now = now_ms();
@@ -415,7 +467,7 @@ impl FerrousNativeManager {
             None,
             None,
         )?;
-        spawn_exit_watcher(Arc::clone(&self.state), id, child);
+        self.reactor.watch_child(id, child)?;
         Ok(record)
     }
 
@@ -467,7 +519,8 @@ impl FerrousNativeManager {
             line_buffer: Vec::new(),
         })));
         if let Some(stderr) = child.stderr.take() {
-            spawn_log_thread(stderr, stderr_file);
+            set_nonblocking(&stderr)?;
+            self.reactor.register_log_stream(stderr, stderr_file)?;
         }
 
         let now = now_ms();
@@ -512,7 +565,7 @@ impl FerrousNativeManager {
             input,
             output,
         )?;
-        spawn_exit_watcher(Arc::clone(&self.state), id, child);
+        self.reactor.watch_child(id, child)?;
         Ok(record)
     }
 
@@ -608,7 +661,7 @@ impl FerrousNativeManager {
             input,
             output,
         )?;
-        spawn_exit_watcher(Arc::clone(&self.state), id, child);
+        self.reactor.watch_child(id, child)?;
         Ok(record)
     }
 
@@ -1374,58 +1427,152 @@ fn take_line(buffer: &mut Vec<u8>) -> Option<String> {
     Some(String::from_utf8_lossy(&raw).into_owned())
 }
 
-fn spawn_log_thread(mut reader: impl Read + Send + 'static, file: File) {
-    thread::spawn(move || {
-        let mut file = BufWriter::with_capacity(256 * 1024, file);
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
-            match reader.read(&mut buffer) {
-                Ok(0) => {
-                    let _ = file.flush();
-                    return;
-                }
-                Ok(n) => {
-                    if file.write_all(&buffer[..n]).is_err() {
-                        return;
-                    }
-                    if file.flush().is_err() {
-                        return;
-                    }
-                }
-                Err(_) => return,
-            }
-        }
-    });
-}
-
-fn spawn_exit_watcher(state: Arc<Mutex<ManagerState>>, shell_id: String, child: Arc<Mutex<Child>>) {
-    thread::spawn(move || {
-        loop {
-            let exit_code = {
-                let mut child = match child.lock() {
-                    Ok(child) => child,
-                    Err(_) => return,
-                };
-                match child.try_wait() {
-                    Ok(Some(status)) => Some(status.code().unwrap_or(-1)),
-                    Ok(None) => None,
-                    Err(_) => Some(-1),
+fn reactor_loop(state: Arc<Mutex<ManagerState>>, rx: Receiver<ReactorCommand>) {
+    let mut streams = Vec::<ReactorLogStream>::new();
+    let mut children = Vec::<ReactorChild>::new();
+    loop {
+        if streams.is_empty() {
+            let received = if children.is_empty() {
+                rx.recv().ok()
+            } else {
+                match rx.recv_timeout(Duration::from_millis(25)) {
+                    Ok(command) => Some(command),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
                 }
             };
-            if let Some(exit_code) = exit_code {
-                if let Ok(mut state) = state.lock() {
-                    if let Some(entry) = state.entries.get_mut(&shell_id) {
-                        entry.record.status = FerrousNativeShellStatus::Exited;
-                        entry.record.exit_code = Some(exit_code);
-                        entry.record.updated_at_ms = now_ms();
-                        let _ = persist_record(&entry.record, &entry.record_path);
-                    }
-                }
-                return;
+            if let Some(command) = received {
+                handle_reactor_command(command, &mut streams, &mut children);
+                drain_reactor_commands(&rx, &mut streams, &mut children);
             }
-            thread::sleep(Duration::from_millis(25));
+            check_reactor_children(&state, &mut children);
+            continue;
         }
-    });
+
+        drain_reactor_commands(&rx, &mut streams, &mut children);
+        poll_reactor_streams(&mut streams, Duration::from_millis(25));
+        check_reactor_children(&state, &mut children);
+    }
+}
+
+fn drain_reactor_commands(
+    rx: &Receiver<ReactorCommand>,
+    streams: &mut Vec<ReactorLogStream>,
+    children: &mut Vec<ReactorChild>,
+) {
+    loop {
+        match rx.try_recv() {
+            Ok(command) => handle_reactor_command(command, streams, children),
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => return,
+        }
+    }
+}
+
+fn handle_reactor_command(
+    command: ReactorCommand,
+    streams: &mut Vec<ReactorLogStream>,
+    children: &mut Vec<ReactorChild>,
+) {
+    match command {
+        ReactorCommand::RegisterLogStream(stream) => streams.push(stream),
+        ReactorCommand::WatchChild(child) => children.push(child),
+    }
+}
+
+fn poll_reactor_streams(streams: &mut Vec<ReactorLogStream>, timeout: Duration) {
+    let mut fds = streams
+        .iter()
+        .map(|stream| {
+            let raw_fd = stream.reader.as_raw_fd();
+            // SAFETY: raw_fd remains owned by `streams` for the duration of this
+            // poll call; fds are dropped before any stream is mutated.
+            let borrowed = unsafe { BorrowedFd::borrow_raw(raw_fd) };
+            PollFd::new(borrowed, PollFlags::POLLIN | PollFlags::POLLHUP)
+        })
+        .collect::<Vec<_>>();
+    let timeout = PollTimeout::try_from(timeout).unwrap_or(PollTimeout::MAX);
+    let Ok(ready_count) = poll(&mut fds, timeout) else {
+        return;
+    };
+    if ready_count == 0 {
+        return;
+    }
+    let ready_indices = fds
+        .iter()
+        .enumerate()
+        .filter_map(|(index, fd)| {
+            fd.revents()
+                .is_some_and(|events| events.intersects(PollFlags::POLLIN | PollFlags::POLLHUP))
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    drop(fds);
+
+    for index in ready_indices.into_iter().rev() {
+        if !drain_reactor_stream(&mut streams[index]) {
+            streams.swap_remove(index);
+        }
+    }
+}
+
+fn drain_reactor_stream(stream: &mut ReactorLogStream) -> bool {
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut wrote = false;
+    loop {
+        match stream.reader.read(&mut buffer) {
+            Ok(0) => {
+                let _ = stream.log.flush();
+                return false;
+            }
+            Ok(n) => {
+                if stream.log.write_all(&buffer[..n]).is_err() {
+                    return false;
+                }
+                wrote = true;
+                if n < buffer.len() {
+                    break;
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(_) => return false,
+        }
+    }
+    if wrote && stream.log.flush().is_err() {
+        return false;
+    }
+    true
+}
+
+fn check_reactor_children(state: &Arc<Mutex<ManagerState>>, children: &mut Vec<ReactorChild>) {
+    let mut exited = Vec::<(usize, i32)>::new();
+    for (index, child_entry) in children.iter().enumerate() {
+        let exit_code = {
+            let Ok(mut child) = child_entry.child.lock() else {
+                exited.push((index, -1));
+                continue;
+            };
+            match child.try_wait() {
+                Ok(Some(status)) => Some(status.code().unwrap_or(-1)),
+                Ok(None) => None,
+                Err(_) => Some(-1),
+            }
+        };
+        if let Some(exit_code) = exit_code {
+            exited.push((index, exit_code));
+        }
+    }
+    for (index, exit_code) in exited.into_iter().rev() {
+        let child_entry = children.swap_remove(index);
+        if let Ok(mut state) = state.lock() {
+            if let Some(entry) = state.entries.get_mut(&child_entry.shell_id) {
+                entry.record.status = FerrousNativeShellStatus::Exited;
+                entry.record.exit_code = Some(exit_code);
+                entry.record.updated_at_ms = now_ms();
+                let _ = persist_record(&entry.record, &entry.record_path);
+            }
+        }
+    }
 }
 
 fn now_ms() -> u128 {
