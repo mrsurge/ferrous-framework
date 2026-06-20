@@ -43,6 +43,8 @@ The `pipe` and `pty` hot paths are direct fd paths. They do not use a Python bri
 
 PTY launch supports explicit terminal mode control through `FerrousNativePtyMode::{Interactive, Raw}`. `Raw` applies `cfmakeraw(...)` to the PTY slave before spawning the child; shellspec `pty_mode` is honored by native launch.
 
+The base native PTY backend is a raw PTY byte-stream backend. The JSONL-out / JSON-RPC-in terminal-stream broker protocol is deferred and should be added later as an explicit higher-level PTY protocol mode/backend if a consumer needs it.
+
 Passive log capture and child exit status are owned by one manager reactor thread instead of per-stream/per-shell helper threads. Pipe and PTY stdout remain caller-driven direct reads; the reactor handles proc stdout/stderr, pipe stderr, and child status persistence.
 
 Output subscription is available through `subscribe_output(shell_id, stream, capacity)`. Subscriptions are bounded: if a subscriber does not drain its queue and a new chunk would exceed capacity, the runtime drops that subscriber instead of buffering unbounded output. Reactor-owned streams publish as they are logged; pipe/PTY stdout publish when the direct read path drains bytes.
