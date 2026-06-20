@@ -1563,12 +1563,359 @@ fn pipe_reports_sequential_jsonrpc_rtt_metrics() {
     );
 }
 
+#[test]
+#[ignore = "performance benchmark; run explicitly with --ignored --nocapture"]
+fn pipe_async_facade_reports_rtt_overhead_against_blocking_direct() {
+    let request_count = 512;
+    let payload_size = 512;
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+
+    let blocking_first = run_blocking_pipe_rtt(request_count, payload_size);
+    let async_second = runtime.block_on(run_async_facade_pipe_rtt(request_count, payload_size));
+    report_pipe_overhead(
+        "blocking_first",
+        request_count,
+        payload_size,
+        blocking_first,
+        async_second,
+    );
+
+    let async_first = runtime.block_on(run_async_facade_pipe_rtt(request_count, payload_size));
+    let blocking_second = run_blocking_pipe_rtt(request_count, payload_size);
+    report_pipe_overhead(
+        "async_first",
+        request_count,
+        payload_size,
+        blocking_second,
+        async_first,
+    );
+
+    let blocking_avg_p50 = (blocking_first.stats.p50_ms + blocking_second.stats.p50_ms) / 2.0;
+    let async_avg_p50 = (async_first.stats.p50_ms + async_second.stats.p50_ms) / 2.0;
+    let blocking_avg_rps = (blocking_first.throughput_rps + blocking_second.throughput_rps) / 2.0;
+    let async_avg_rps = (async_first.throughput_rps + async_second.throughput_rps) / 2.0;
+    eprintln!(
+        "ferrous_pipe_async_facade_overhead_summary requests={} payload_bytes={} blocking_avg_p50_ms={:.3} async_avg_p50_ms={:.3} avg_p50_delta_ms={:.3} blocking_avg_rps={:.1} async_avg_rps={:.1} avg_throughput_ratio={:.3}",
+        request_count,
+        payload_size,
+        blocking_avg_p50,
+        async_avg_p50,
+        async_avg_p50 - blocking_avg_p50,
+        blocking_avg_rps,
+        async_avg_rps,
+        async_avg_rps / blocking_avg_rps,
+    );
+
+    assert_eq!(blocking_first.responses, request_count);
+    assert_eq!(blocking_second.responses, request_count);
+    assert_eq!(async_first.responses, request_count);
+    assert_eq!(async_second.responses, request_count);
+}
+
+#[test]
+#[ignore = "performance benchmark; run explicitly with --ignored --nocapture"]
+fn pipe_async_facade_reports_concurrent_inflight_metrics() {
+    let request_count = 1024;
+    let concurrency = 64;
+    let payload_size = 512;
+    let worker_threads = 4;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let result = runtime.block_on(run_async_facade_pipe_concurrent_rtt(
+        request_count,
+        concurrency,
+        payload_size,
+    ));
+    eprintln!(
+        "ferrous_pipe_async_facade_concurrent requests={} concurrency={} worker_threads={} payload_bytes={} elapsed_ms={:.3} throughput_rps={:.1} min_ms={:.3} p50_ms={:.3} p95_ms={:.3} max_ms={:.3}",
+        request_count,
+        concurrency,
+        worker_threads,
+        payload_size,
+        result.elapsed.as_secs_f64() * 1000.0,
+        result.throughput_rps,
+        result.stats.min_ms,
+        result.stats.p50_ms,
+        result.stats.p95_ms,
+        result.stats.max_ms,
+    );
+    assert_eq!(result.responses, request_count);
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct DurationStats {
     min_ms: f64,
     p50_ms: f64,
     p95_ms: f64,
     max_ms: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PipeBenchResult {
+    responses: usize,
+    elapsed: Duration,
+    throughput_rps: f64,
+    stats: DurationStats,
+}
+
+fn report_pipe_overhead(
+    order: &str,
+    request_count: usize,
+    payload_size: usize,
+    blocking: PipeBenchResult,
+    async_facade: PipeBenchResult,
+) {
+    let p50_delta_ms = async_facade.stats.p50_ms - blocking.stats.p50_ms;
+    let p95_delta_ms = async_facade.stats.p95_ms - blocking.stats.p95_ms;
+    let throughput_ratio = async_facade.throughput_rps / blocking.throughput_rps;
+    eprintln!(
+        "ferrous_pipe_async_facade_overhead order={} requests={} payload_bytes={} blocking_elapsed_ms={:.3} blocking_rps={:.1} blocking_p50_ms={:.3} blocking_p95_ms={:.3} async_elapsed_ms={:.3} async_rps={:.1} async_p50_ms={:.3} async_p95_ms={:.3} p50_delta_ms={:.3} p95_delta_ms={:.3} throughput_ratio={:.3}",
+        order,
+        request_count,
+        payload_size,
+        blocking.elapsed.as_secs_f64() * 1000.0,
+        blocking.throughput_rps,
+        blocking.stats.p50_ms,
+        blocking.stats.p95_ms,
+        async_facade.elapsed.as_secs_f64() * 1000.0,
+        async_facade.throughput_rps,
+        async_facade.stats.p50_ms,
+        async_facade.stats.p95_ms,
+        p50_delta_ms,
+        p95_delta_ms,
+        throughput_ratio,
+    );
+}
+
+fn run_blocking_pipe_rtt(request_count: usize, payload_size: usize) -> PipeBenchResult {
+    let manager = FerrousNativeManager::new();
+    let record = manager
+        .spawn_pipe_blocking(base_pipe_config(
+            jsonrpc_echo_command(),
+            test_log_dir("pipe-blocking-rtt-overhead"),
+        ))
+        .expect("spawn blocking pipe");
+    let result = run_pipe_rtt_loop(
+        request_count,
+        payload_size,
+        |line| {
+            manager
+                .write_line_blocking(&record.id, line)
+                .expect("blocking write request");
+        },
+        || {
+            manager
+                .read_line_blocking(&record.id, Duration::from_secs(3))
+                .expect("blocking read line")
+                .expect("blocking response line")
+        },
+    );
+    manager
+        .terminate_shell_blocking(&record.id)
+        .expect("terminate blocking pipe");
+    result
+}
+
+async fn run_async_facade_pipe_rtt(request_count: usize, payload_size: usize) -> PipeBenchResult {
+    let manager = FerrousNativeManager::new();
+    let record = manager
+        .spawn_shell_pipe(base_pipe_config(
+            jsonrpc_echo_command(),
+            test_log_dir("pipe-async-rtt-overhead"),
+        ))
+        .await
+        .expect("spawn async facade pipe");
+    let mut latencies = Vec::with_capacity(request_count);
+    let bench_started = Instant::now();
+    for id in 1..=request_count {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "bench.echo",
+            "params": {
+                "echo": format!("overhead-{id}"),
+                "push_count": 0,
+                "payload_size": payload_size
+            }
+        });
+        let started = Instant::now();
+        manager
+            .write_to_shell(&record.id, &request.to_string(), true)
+            .await
+            .expect("async facade write request");
+        let line = {
+            manager
+                .read_line_blocking(&record.id, Duration::from_secs(3))
+                .expect("async facade read line")
+                .expect("async facade response line")
+        };
+        latencies.push(started.elapsed());
+        assert_pipe_rtt_response(&line, id, payload_size);
+    }
+    let elapsed = bench_started.elapsed();
+    let result = PipeBenchResult {
+        responses: request_count,
+        elapsed,
+        throughput_rps: request_count as f64 / elapsed.as_secs_f64(),
+        stats: duration_stats(&latencies),
+    };
+    manager
+        .terminate_shell(&record.id, true)
+        .await
+        .expect("terminate async facade pipe");
+    result
+}
+
+async fn run_async_facade_pipe_concurrent_rtt(
+    request_count: usize,
+    concurrency: usize,
+    payload_size: usize,
+) -> PipeBenchResult {
+    let manager = FerrousNativeManager::new();
+    let record = manager
+        .spawn_shell_pipe(base_pipe_config(
+            jsonrpc_echo_command(),
+            test_log_dir("pipe-async-concurrent-rtt"),
+        ))
+        .await
+        .expect("spawn async facade pipe");
+    let shell_id = record.id.clone();
+    let waiters = std::sync::Arc::new(std::sync::Mutex::new(HashMap::<
+        usize,
+        tokio::sync::oneshot::Sender<String>,
+    >::new()));
+    let reader_manager = manager.clone();
+    let reader_shell_id = shell_id.clone();
+    let reader_waiters = std::sync::Arc::clone(&waiters);
+    let reader = tokio::task::spawn_blocking(move || {
+        let mut received = 0_usize;
+        while received < request_count {
+            let line = reader_manager
+                .read_line_blocking(&reader_shell_id, Duration::from_secs(5))
+                .expect("concurrent read line")
+                .expect("concurrent response line");
+            let response: Value = serde_json::from_str(&line).expect("concurrent response json");
+            let id = response
+                .get("id")
+                .and_then(Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .expect("concurrent response id");
+            let waiter = reader_waiters
+                .lock()
+                .expect("waiter map lock")
+                .remove(&id)
+                .expect("response waiter");
+            waiter.send(line).expect("send response to waiter");
+            received += 1;
+        }
+        received
+    });
+
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let bench_started = Instant::now();
+    let mut handles = Vec::with_capacity(request_count);
+    for id in 1..=request_count {
+        let manager = manager.clone();
+        let shell_id = shell_id.clone();
+        let waiters = std::sync::Arc::clone(&waiters);
+        let semaphore = std::sync::Arc::clone(&semaphore);
+        handles.push(tokio::spawn(async move {
+            let _permit = semaphore.acquire_owned().await.expect("semaphore permit");
+            let request = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "bench.echo",
+                "params": {
+                    "echo": format!("concurrent-{id}"),
+                    "push_count": 0,
+                    "payload_size": payload_size
+                }
+            });
+            let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+            waiters.lock().expect("waiter map lock").insert(id, tx);
+            let started = Instant::now();
+            manager
+                .write_to_shell(&shell_id, &request.to_string(), true)
+                .await
+                .expect("concurrent async facade write request");
+            let line = rx.await.expect("concurrent response");
+            assert_pipe_rtt_response(&line, id, payload_size);
+            started.elapsed()
+        }));
+    }
+    let mut latencies = Vec::with_capacity(request_count);
+    for handle in handles {
+        latencies.push(handle.await.expect("request task"));
+    }
+    let received = reader.await.expect("reader task");
+    assert_eq!(received, request_count);
+    let elapsed = bench_started.elapsed();
+    manager
+        .terminate_shell(&record.id, true)
+        .await
+        .expect("terminate concurrent async facade pipe");
+    PipeBenchResult {
+        responses: request_count,
+        elapsed,
+        throughput_rps: request_count as f64 / elapsed.as_secs_f64(),
+        stats: duration_stats(&latencies),
+    }
+}
+
+fn run_pipe_rtt_loop(
+    request_count: usize,
+    payload_size: usize,
+    mut write_request: impl FnMut(&str),
+    mut read_response: impl FnMut() -> String,
+) -> PipeBenchResult {
+    let mut latencies = Vec::with_capacity(request_count);
+    let bench_started = Instant::now();
+    for id in 1..=request_count {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "bench.echo",
+            "params": {
+                "echo": format!("overhead-{id}"),
+                "push_count": 0,
+                "payload_size": payload_size
+            }
+        });
+        let started = Instant::now();
+        write_request(&request.to_string());
+        let line = read_response();
+        latencies.push(started.elapsed());
+
+        assert_pipe_rtt_response(&line, id, payload_size);
+    }
+    let elapsed = bench_started.elapsed();
+    PipeBenchResult {
+        responses: request_count,
+        elapsed,
+        throughput_rps: request_count as f64 / elapsed.as_secs_f64(),
+        stats: duration_stats(&latencies),
+    }
+}
+
+fn assert_pipe_rtt_response(line: &str, id: usize, payload_size: usize) {
+    let response: Value = serde_json::from_str(line).expect("response json");
+    assert_eq!(response.get("id").and_then(Value::as_i64), Some(id as i64));
+    assert_eq!(
+        response
+            .get("result")
+            .and_then(|result| result.get("payload"))
+            .and_then(Value::as_str)
+            .map(str::len),
+        Some(payload_size)
+    );
 }
 
 fn duration_stats(samples: &[Duration]) -> DurationStats {

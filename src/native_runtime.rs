@@ -495,12 +495,7 @@ impl FerrousNativeManager {
     }
 
     pub async fn write_to_pipe(&self, shell_id: &str, data: &str) -> Result<()> {
-        let manager = self.clone();
-        let shell_id = shell_id.to_owned();
-        let data = data.as_bytes().to_vec();
-        tokio::task::spawn_blocking(move || manager.write_to_pipe_blocking(&shell_id, &data))
-            .await
-            .context("native pipe write task failed")?
+        self.write_to_pipe_blocking(shell_id, data.as_bytes())
     }
 
     pub async fn write_to_shell(
@@ -509,22 +504,11 @@ impl FerrousNativeManager {
         data: &str,
         append_newline: bool,
     ) -> Result<FerrousShellInputResult> {
-        let manager = self.clone();
-        let shell_id = shell_id.to_owned();
-        let data = data.to_owned();
-        tokio::task::spawn_blocking(move || {
-            manager.write_to_shell_blocking(&shell_id, &data, append_newline)
-        })
-        .await
-        .context("native shell write task failed")?
+        self.write_to_shell_blocking(shell_id, data, append_newline)
     }
 
     pub async fn send_shell_eof(&self, shell_id: &str) -> Result<FerrousShellInputResult> {
-        let manager = self.clone();
-        let shell_id = shell_id.to_owned();
-        tokio::task::spawn_blocking(move || manager.send_shell_eof_blocking(&shell_id))
-            .await
-            .context("native shell EOF task failed")?
+        self.send_shell_eof_blocking(shell_id)
     }
 
     pub async fn terminate_shell(&self, shell_id: &str, force: bool) -> Result<()> {

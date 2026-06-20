@@ -72,6 +72,8 @@ The manager also exposes a Python-FWS-shaped async facade for downstream Rust ca
 
 These methods are compatibility names over the same native runtime. They do not add JSON-RPC framing, app protocol routing, or Python networking behavior.
 
+The async write/EOF compatibility methods stay on the direct native path. They do not call `tokio::task::spawn_blocking(...)` per packet; lifecycle-heavy operations such as spawn/terminate can still use blocking-task boundaries.
+
 For ALS-style pipe consumers, `FerrousFrameworkPipe::spawn(FerrousPipeConfig { ... })` provides the legacy blocking adapter shape: `shell_id()`, `write_line_blocking(...)`, `read_line_blocking()`, and `close_blocking()`. It is intentionally pipe-only. If a shellspec renders to a non-pipe backend, the adapter errors instead of pretending line-oriented pipe semantics are available.
 
 `pyo3_embed_enabled()` is retained as a legacy availability gate for older callers. In the native crate it reports the compatibility surface is available; it does not mean Python is in the runtime path. `ferrous_native_enabled()` is the literal native runtime capability flag.
@@ -179,4 +181,11 @@ The PTY terminal path has a focused request/response timing smoke:
 
 ```sh
 cargo test pty_terminal -- --nocapture
+```
+
+The async facade performance probes are opt-in ignored tests, so they do not run during default correctness checks:
+
+```sh
+cargo test --release pipe_async_facade_reports_rtt_overhead_against_blocking_direct -- --ignored --nocapture
+cargo test --release pipe_async_facade_reports_concurrent_inflight_metrics -- --ignored --nocapture
 ```
