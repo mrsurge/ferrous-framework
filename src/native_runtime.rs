@@ -82,6 +82,14 @@ pub struct FerrousNativeOutputSubscription {
     rx: Receiver<FerrousNativeOutputChunk>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FerrousNativePtyMode {
+    Raw,
+    #[default]
+    Interactive,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FerrousNativeShellRecord {
     pub id: String,
@@ -99,6 +107,7 @@ pub struct FerrousNativeShellRecord {
     pub record_path: PathBuf,
     pub stdout_log: PathBuf,
     pub stderr_log: PathBuf,
+    pub pty_mode: Option<FerrousNativePtyMode>,
     pub capabilities: FerrousNativeShellCapabilities,
     pub adopted: bool,
     pub created_at_ms: u128,
@@ -158,6 +167,7 @@ pub struct FerrousNativePtyConfig {
     pub spec_id: String,
     pub subgroups: Vec<String>,
     pub log_dir: Option<PathBuf>,
+    pub mode: FerrousNativePtyMode,
 }
 
 #[derive(Clone)]
@@ -209,6 +219,7 @@ struct PersistedNativeShellRecord {
     record_path: String,
     stdout_log: String,
     stderr_log: String,
+    pty_mode: Option<FerrousNativePtyMode>,
     io_metadata_log: Option<String>,
     created_at_ms: u128,
     updated_at_ms: u128,
@@ -393,6 +404,7 @@ impl FerrousNativeManager {
                 spec_id: spec.id,
                 subgroups: spec.subgroups,
                 log_dir: None,
+                mode: parse_pty_mode(&spec.pty_mode)?,
             }),
             backend => bail!("unsupported native shellspec backend '{backend}'"),
         }?;
@@ -521,6 +533,7 @@ impl FerrousNativeManager {
             record_path: record_path.clone(),
             stdout_log,
             stderr_log,
+            pty_mode: None,
             capabilities: FerrousNativeShellCapabilities {
                 stdin_write: false,
                 stdin_eof: false,
@@ -628,6 +641,7 @@ impl FerrousNativeManager {
             record_path: record_path.clone(),
             stdout_log,
             stderr_log,
+            pty_mode: None,
             capabilities: FerrousNativeShellCapabilities {
                 stdin_write: input.is_some(),
                 stdin_eof: input.is_some(),
@@ -679,6 +693,7 @@ impl FerrousNativeManager {
             .with_context(|| format!("failed to create stderr log {}", stderr_log.display()))?;
 
         let pty = openpty(None, None).context("failed to open PTY")?;
+        apply_pty_mode(pty.slave.as_raw_fd(), config.mode)?;
         let slave_stdin = dup(&pty.slave).context("failed to duplicate PTY slave stdin")?;
         let slave_stdout = dup(&pty.slave).context("failed to duplicate PTY slave stdout")?;
         let slave_stderr = pty.slave;
@@ -729,6 +744,7 @@ impl FerrousNativeManager {
             record_path: record_path.clone(),
             stdout_log,
             stderr_log,
+            pty_mode: Some(config.mode),
             capabilities: FerrousNativeShellCapabilities {
                 stdin_write: true,
                 stdin_eof: true,
@@ -1253,6 +1269,7 @@ pub fn load_persisted_record(path: impl AsRef<Path>) -> Result<FerrousNativeShel
         record_path: PathBuf::from(persisted.record_path),
         stdout_log: PathBuf::from(persisted.stdout_log),
         stderr_log: PathBuf::from(persisted.stderr_log),
+        pty_mode: persisted.pty_mode,
         capabilities,
         adopted: true,
         created_at_ms: persisted.created_at_ms,
@@ -1306,6 +1323,7 @@ fn persist_record(record: &FerrousNativeShellRecord, path: &std::path::Path) -> 
         record_path: path_to_string(&record.record_path),
         stdout_log: path_to_string(&record.stdout_log),
         stderr_log: path_to_string(&record.stderr_log),
+        pty_mode: record.pty_mode,
         io_metadata_log: None,
         created_at_ms: record.created_at_ms,
         updated_at_ms: record.updated_at_ms,
@@ -1342,6 +1360,39 @@ fn sorted_env_keys(env: &HashMap<String, String>) -> Vec<String> {
 fn set_nonblocking(fd: &impl AsFd) -> Result<()> {
     let flags = OFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFL)?);
     fcntl(fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
+    Ok(())
+}
+
+fn parse_pty_mode(raw: &str) -> Result<FerrousNativePtyMode> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "interactive" | "cooked" => Ok(FerrousNativePtyMode::Interactive),
+        "raw" => Ok(FerrousNativePtyMode::Raw),
+        other => bail!("unsupported native PTY mode '{other}'"),
+    }
+}
+
+fn apply_pty_mode(fd: i32, mode: FerrousNativePtyMode) -> Result<()> {
+    match mode {
+        FerrousNativePtyMode::Interactive => Ok(()),
+        FerrousNativePtyMode::Raw => apply_pty_raw_mode(fd),
+    }
+}
+
+fn apply_pty_raw_mode(fd: i32) -> Result<()> {
+    // SAFETY: zeroed termios is immediately initialized by tcgetattr before use.
+    let mut termios = unsafe { std::mem::zeroed::<libc::termios>() };
+    // SAFETY: fd is the live PTY slave fd, and termios points to valid writable storage.
+    if unsafe { libc::tcgetattr(fd, &mut termios) } == -1 {
+        return Err(std::io::Error::last_os_error()).context("failed to read PTY termios");
+    }
+    // SAFETY: cfmakeraw mutates a valid termios struct in place.
+    unsafe {
+        libc::cfmakeraw(&mut termios);
+    }
+    // SAFETY: fd is the live PTY slave fd, and termios points to initialized settings.
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &termios) } == -1 {
+        return Err(std::io::Error::last_os_error()).context("failed to set PTY raw mode");
+    }
     Ok(())
 }
 

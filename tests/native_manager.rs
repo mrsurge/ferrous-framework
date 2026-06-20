@@ -1,7 +1,7 @@
 use ferrous_framework::{
     FerrousNativeEnv, FerrousNativeManager, FerrousNativeOutputStream, FerrousNativePipeConfig,
-    FerrousNativeProcConfig, FerrousNativePtyConfig, FerrousNativeShellStatus, FerrousNativeStore,
-    shellspec::ShellspecRenderInput,
+    FerrousNativeProcConfig, FerrousNativePtyConfig, FerrousNativePtyMode,
+    FerrousNativeShellStatus, FerrousNativeStore, shellspec::ShellspecRenderInput,
 };
 use serde_json::{Value, json};
 use std::{
@@ -58,6 +58,7 @@ fn base_pty_config(command: Vec<String>, log_dir: PathBuf) -> FerrousNativePtyCo
         spec_id: "native-pty-test".to_owned(),
         subgroups: vec!["tests".to_owned()],
         log_dir: Some(log_dir),
+        mode: FerrousNativePtyMode::Interactive,
     }
 }
 
@@ -479,6 +480,30 @@ fn shellspec_entry_waits_for_tcp_port_readiness() {
 }
 
 #[test]
+fn shellspec_entry_launches_native_pty_with_rendered_mode() {
+    let manager = test_manager_with_store("shellspec-pty-mode");
+    let document = json!({
+        "version": "1",
+        "shells": {
+            "terminal": {
+                "backend": "pty",
+                "pty_mode": "raw",
+                "command": ["sh", "-c", "stty -a"]
+            }
+        }
+    });
+    let record = manager
+        .spawn_shellspec_entry_blocking(&document, "terminal", &ShellspecRenderInput::default())
+        .expect("spawn shellspec pty");
+    assert_eq!(record.backend, "pty");
+    assert_eq!(record.pty_mode, Some(FerrousNativePtyMode::Raw));
+    let output = read_chunks_until_contains(&manager, &record.id, "icanon", Duration::from_secs(3))
+        .expect("read stty output")
+        .expect("stty output");
+    assert!(output.contains("-icanon"), "stty output: {output}");
+}
+
+#[test]
 fn shellspec_apply_starts_autostart_specs_once() {
     let manager = test_manager_with_store("shellspec-apply-starts-once");
     let document = json!({
@@ -776,6 +801,7 @@ fn pty_writes_stdin_and_reads_output_lines() {
         .expect("spawn pty");
 
     assert_eq!(record.backend, "pty");
+    assert_eq!(record.pty_mode, Some(FerrousNativePtyMode::Interactive));
     assert!(record.capabilities.stdin_write);
     assert!(record.capabilities.stdin_eof);
     assert!(record.capabilities.output_read);
@@ -807,6 +833,33 @@ fn pty_writes_stdin_and_reads_output_lines() {
         manager
             .terminate_shell_blocking(&record.id)
             .expect("terminate shell")
+    );
+}
+
+#[test]
+fn pty_raw_mode_applies_raw_slave_termios() {
+    let manager = FerrousNativeManager::new();
+    let log_dir = test_log_dir("pty-raw-mode");
+    let mut config = base_pty_config(
+        vec!["sh".to_owned(), "-c".to_owned(), "stty -a".to_owned()],
+        log_dir,
+    );
+    config.mode = FerrousNativePtyMode::Raw;
+    let record = manager.spawn_pty_blocking(config).expect("spawn raw pty");
+    assert_eq!(record.pty_mode, Some(FerrousNativePtyMode::Raw));
+    let output = read_chunks_until_contains(&manager, &record.id, "icanon", Duration::from_secs(3))
+        .expect("read stty output")
+        .expect("stty output");
+    assert!(output.contains("-icanon"), "stty output: {output}");
+    assert!(output.contains("-echo"), "stty output: {output}");
+    let persisted: Value = serde_json::from_str(&eventually_read_to_string(
+        &record.record_path,
+        Duration::from_secs(3),
+    ))
+    .expect("persisted raw pty record");
+    assert_eq!(
+        persisted.get("pty_mode").and_then(Value::as_str),
+        Some("raw")
     );
 }
 
@@ -1268,6 +1321,32 @@ fn percentile(sorted: &[f64], q: f64) -> f64 {
     let upper = usize::min(lower + 1, sorted.len() - 1);
     let weight = position - lower as f64;
     sorted[lower] * (1.0 - weight) + sorted[upper] * weight
+}
+
+fn read_chunks_until_contains(
+    manager: &FerrousNativeManager,
+    shell_id: &str,
+    needle: &str,
+    timeout: Duration,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let started = Instant::now();
+    let mut out = Vec::new();
+    while started.elapsed() < timeout {
+        if let Some(chunk) =
+            manager.read_stdout_chunk_blocking(shell_id, Duration::from_millis(100))?
+        {
+            out.extend_from_slice(&chunk);
+            let content = String::from_utf8_lossy(&out);
+            if content.contains(needle) {
+                return Ok(Some(content.into_owned()));
+            }
+        }
+    }
+    if out.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(String::from_utf8_lossy(&out).into_owned()))
+    }
 }
 
 fn eventually_read_to_string(path: &PathBuf, timeout: Duration) -> String {

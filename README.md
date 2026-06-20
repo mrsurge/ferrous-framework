@@ -23,6 +23,7 @@ Current native API:
 - `FerrousNativeProcConfig`
 - `FerrousNativePipeConfig`
 - `FerrousNativePtyConfig`
+- `FerrousNativePtyMode`
 - `FerrousNativeShellRecord`
 - `FerrousNativeShellStatus`
 - `FerrousNativeShellCapabilities`
@@ -39,6 +40,8 @@ pty: launch, direct PTY writes/EOF, direct PTY reads, PTY resize, PTY output log
 ```
 
 The `pipe` and `pty` hot paths are direct fd paths. They do not use a Python bridge, a stdout pump queue, or a drain worker. Reads are caller-driven and tee output to the log as bytes are read.
+
+PTY launch supports explicit terminal mode control through `FerrousNativePtyMode::{Interactive, Raw}`. `Raw` applies `cfmakeraw(...)` to the PTY slave before spawning the child; shellspec `pty_mode` is honored by native launch.
 
 Passive log capture and child exit status are owned by one manager reactor thread instead of per-stream/per-shell helper threads. Pipe and PTY stdout remain caller-driven direct reads; the reactor handles proc stdout/stderr, pipe stderr, and child status persistence.
 
