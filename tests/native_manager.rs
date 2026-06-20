@@ -247,6 +247,58 @@ fn native_record_sidecar_is_persisted_without_env_values() {
         initial.get("run_id").and_then(Value::as_str),
         Some("run-from-manager")
     );
+    assert_eq!(
+        initial.get("runtime_id").and_then(Value::as_str),
+        Some(manager.store().runtime_id.as_str())
+    );
+    assert_eq!(
+        initial.get("autostart").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(initial.get("backend").and_then(Value::as_str), Some("proc"));
+    assert_eq!(
+        initial.get("uses_pty").and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        initial.get("uses_pipes").and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        initial.get("uses_dtach").and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(initial.get("app_id").and_then(Value::as_str), Some("tests"));
+    assert_eq!(
+        initial.get("is_app_worker").and_then(Value::as_bool),
+        Some(false)
+    );
+    assert!(initial.get("ui").and_then(Value::as_object).is_some());
+    assert!(initial.get("debug").and_then(Value::as_object).is_some());
+    assert!(
+        initial
+            .get("env_overrides")
+            .and_then(Value::as_object)
+            .is_some_and(serde_json::Map::is_empty)
+    );
+    assert!(
+        initial
+            .get("io_metadata_log")
+            .and_then(Value::as_str)
+            .is_some_and(|path| path.ends_with(".io_metadata.jsonl"))
+    );
+    assert!(
+        initial
+            .get("created_at")
+            .and_then(Value::as_f64)
+            .is_some_and(|value| value > 0.0)
+    );
+    assert!(
+        initial
+            .get("updated_at")
+            .and_then(Value::as_f64)
+            .is_some_and(|value| value > 0.0)
+    );
     let env_keys = initial
         .get("env_keys")
         .and_then(Value::as_array)
@@ -638,6 +690,12 @@ fn fresh_manager_lists_persisted_records_as_adopted_stale_records() {
     assert!(loaded.capabilities.stdout_log);
     assert!(!loaded.capabilities.stdout_subscribe);
     assert!(!loaded.capabilities.stderr_subscribe);
+    assert!(loaded.io_metadata_log.is_some());
+    assert_eq!(loaded.runtime_id, Some(manager.store().runtime_id));
+    assert_eq!(loaded.app_id, Some("tests".to_owned()));
+    assert!(loaded.ui.is_empty());
+    assert!(loaded.debug.is_empty());
+    assert!(loaded.autostart);
     assert!(loaded.env.is_empty());
     assert!(
         loaded

@@ -12,7 +12,7 @@ use nix::{
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -107,7 +107,15 @@ pub struct FerrousNativeShellRecord {
     pub record_path: PathBuf,
     pub stdout_log: PathBuf,
     pub stderr_log: PathBuf,
+    pub io_metadata_log: Option<PathBuf>,
     pub pty_mode: Option<FerrousNativePtyMode>,
+    pub autostart: bool,
+    pub ui: Map<String, Value>,
+    pub debug: Map<String, Value>,
+    pub runtime_id: Option<String>,
+    pub app_id: Option<String>,
+    pub parent_shell_id: Option<String>,
+    pub is_app_worker: bool,
     pub capabilities: FerrousNativeShellCapabilities,
     pub adopted: bool,
     pub created_at_ms: u128,
@@ -219,13 +227,49 @@ struct PersistedNativeShellRecord {
     record_path: String,
     stdout_log: String,
     stderr_log: String,
-    pty_mode: Option<FerrousNativePtyMode>,
+    #[serde(default)]
     io_metadata_log: Option<String>,
+    #[serde(default)]
+    pty_mode: Option<FerrousNativePtyMode>,
+    #[serde(default = "default_true")]
+    autostart: bool,
+    #[serde(default)]
+    ui: Map<String, Value>,
+    #[serde(default)]
+    debug: Map<String, Value>,
+    #[serde(default)]
     created_at_ms: u128,
+    #[serde(default)]
     updated_at_ms: u128,
+    #[serde(default)]
+    created_at: Option<f64>,
+    #[serde(default)]
+    updated_at: Option<f64>,
+    #[serde(default)]
     run_id: Option<String>,
+    #[serde(default)]
     launcher_pid: u32,
+    #[serde(default)]
     env_keys: Vec<String>,
+    #[serde(default)]
+    env_overrides: Map<String, Value>,
+    #[serde(default)]
+    uses_pty: bool,
+    #[serde(default)]
+    uses_pipes: bool,
+    #[serde(default)]
+    uses_dtach: bool,
+    #[serde(default)]
+    runtime_id: Option<String>,
+    #[serde(default)]
+    signature: Option<String>,
+    #[serde(default)]
+    app_id: Option<String>,
+    #[serde(default)]
+    parent_shell_id: Option<String>,
+    #[serde(default)]
+    is_app_worker: bool,
+    #[serde(default)]
     capabilities: FerrousNativeShellCapabilities,
 }
 
@@ -517,6 +561,9 @@ impl FerrousNativeManager {
         }
 
         let now = now_ms();
+        let io_metadata_log = Some(io_metadata_path_for(&log_dir, &id));
+        let app_id = derive_app_id(&config.label, &config.subgroups);
+        let is_app_worker = config.label.starts_with("app-worker:");
         let record = FerrousNativeShellRecord {
             id: id.clone(),
             backend: "proc".to_owned(),
@@ -533,7 +580,15 @@ impl FerrousNativeManager {
             record_path: record_path.clone(),
             stdout_log,
             stderr_log,
+            io_metadata_log,
             pty_mode: None,
+            autostart: true,
+            ui: Map::new(),
+            debug: Map::new(),
+            runtime_id: Some(self.store.runtime_id.clone()),
+            app_id,
+            parent_shell_id: None,
+            is_app_worker,
             capabilities: FerrousNativeShellCapabilities {
                 stdin_write: false,
                 stdin_eof: false,
@@ -625,6 +680,9 @@ impl FerrousNativeManager {
         }
 
         let now = now_ms();
+        let io_metadata_log = Some(io_metadata_path_for(&log_dir, &id));
+        let app_id = derive_app_id(&config.label, &config.subgroups);
+        let is_app_worker = config.label.starts_with("app-worker:");
         let record = FerrousNativeShellRecord {
             id: id.clone(),
             backend: "pipe".to_owned(),
@@ -641,7 +699,15 @@ impl FerrousNativeManager {
             record_path: record_path.clone(),
             stdout_log,
             stderr_log,
+            io_metadata_log,
             pty_mode: None,
+            autostart: true,
+            ui: Map::new(),
+            debug: Map::new(),
+            runtime_id: Some(self.store.runtime_id.clone()),
+            app_id,
+            parent_shell_id: None,
+            is_app_worker,
             capabilities: FerrousNativeShellCapabilities {
                 stdin_write: input.is_some(),
                 stdin_eof: input.is_some(),
@@ -728,6 +794,9 @@ impl FerrousNativeManager {
         })));
 
         let now = now_ms();
+        let io_metadata_log = Some(io_metadata_path_for(&log_dir, &id));
+        let app_id = derive_app_id(&config.label, &config.subgroups);
+        let is_app_worker = config.label.starts_with("app-worker:");
         let record = FerrousNativeShellRecord {
             id: id.clone(),
             backend: "pty".to_owned(),
@@ -744,7 +813,15 @@ impl FerrousNativeManager {
             record_path: record_path.clone(),
             stdout_log,
             stderr_log,
+            io_metadata_log,
             pty_mode: Some(config.mode),
+            autostart: true,
+            ui: Map::new(),
+            debug: Map::new(),
+            runtime_id: Some(self.store.runtime_id.clone()),
+            app_id,
+            parent_shell_id: None,
+            is_app_worker,
             capabilities: FerrousNativeShellCapabilities {
                 stdin_write: true,
                 stdin_eof: true,
@@ -1239,6 +1316,35 @@ fn record_path_for(log_dir: &std::path::Path, shell_id: &str) -> PathBuf {
     log_dir.join(format!("{shell_id}.record.json"))
 }
 
+fn io_metadata_path_for(log_dir: &std::path::Path, shell_id: &str) -> PathBuf {
+    log_dir.join(format!("{shell_id}.io_metadata.jsonl"))
+}
+
+fn derive_app_id(label: &str, subgroups: &[String]) -> Option<String> {
+    label
+        .strip_prefix("app-worker:")
+        .map(str::to_owned)
+        .or_else(|| subgroups.first().cloned())
+}
+
+fn ms_to_seconds(value: u128) -> f64 {
+    value as f64 / 1000.0
+}
+
+fn coerce_ms_timestamp(raw_ms: u128, raw_seconds: Option<f64>) -> u128 {
+    if raw_ms != 0 {
+        return raw_ms;
+    }
+    raw_seconds
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .map(|value| (value * 1000.0) as u128)
+        .unwrap_or_default()
+}
+
+fn default_true() -> bool {
+    true
+}
+
 pub fn load_persisted_record(path: impl AsRef<Path>) -> Result<FerrousNativeShellRecord> {
     let path = path.as_ref();
     let raw = read_to_string(path)
@@ -1253,6 +1359,11 @@ pub fn load_persisted_record(path: impl AsRef<Path>) -> Result<FerrousNativeShel
     capabilities.output_read = false;
     capabilities.terminate = false;
     capabilities.resize = false;
+    let created_at_ms = coerce_ms_timestamp(persisted.created_at_ms, persisted.created_at);
+    let updated_at_ms = coerce_ms_timestamp(persisted.updated_at_ms, persisted.updated_at);
+    let app_id = persisted
+        .app_id
+        .or_else(|| derive_app_id(&persisted.label, &persisted.subgroups));
     Ok(FerrousNativeShellRecord {
         id: persisted.id,
         backend: persisted.backend,
@@ -1269,11 +1380,19 @@ pub fn load_persisted_record(path: impl AsRef<Path>) -> Result<FerrousNativeShel
         record_path: PathBuf::from(persisted.record_path),
         stdout_log: PathBuf::from(persisted.stdout_log),
         stderr_log: PathBuf::from(persisted.stderr_log),
+        io_metadata_log: persisted.io_metadata_log.map(PathBuf::from),
         pty_mode: persisted.pty_mode,
+        autostart: persisted.autostart,
+        ui: persisted.ui,
+        debug: persisted.debug,
+        runtime_id: persisted.runtime_id,
+        app_id,
+        parent_shell_id: persisted.parent_shell_id,
+        is_app_worker: persisted.is_app_worker,
         capabilities,
         adopted: true,
-        created_at_ms: persisted.created_at_ms,
-        updated_at_ms: persisted.updated_at_ms,
+        created_at_ms,
+        updated_at_ms,
     })
 }
 
@@ -1323,13 +1442,27 @@ fn persist_record(record: &FerrousNativeShellRecord, path: &std::path::Path) -> 
         record_path: path_to_string(&record.record_path),
         stdout_log: path_to_string(&record.stdout_log),
         stderr_log: path_to_string(&record.stderr_log),
+        io_metadata_log: record.io_metadata_log.as_ref().map(path_to_string),
         pty_mode: record.pty_mode,
-        io_metadata_log: None,
+        autostart: record.autostart,
+        ui: record.ui.clone(),
+        debug: record.debug.clone(),
         created_at_ms: record.created_at_ms,
         updated_at_ms: record.updated_at_ms,
+        created_at: Some(ms_to_seconds(record.created_at_ms)),
+        updated_at: Some(ms_to_seconds(record.updated_at_ms)),
         run_id: record.env.get("FRAMEWORK_SHELLS_RUN_ID").cloned(),
         launcher_pid: std::process::id(),
         env_keys: record.env_keys.clone(),
+        env_overrides: Map::new(),
+        uses_pty: record.backend == "pty",
+        uses_pipes: record.backend == "pipe",
+        uses_dtach: false,
+        runtime_id: record.runtime_id.clone(),
+        signature: None,
+        app_id: record.app_id.clone(),
+        parent_shell_id: record.parent_shell_id.clone(),
+        is_app_worker: record.is_app_worker,
         capabilities: record.capabilities.clone(),
     };
     let tmp_path = path.with_extension("record.json.tmp");
