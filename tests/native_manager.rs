@@ -811,6 +811,68 @@ fn pty_writes_stdin_and_reads_output_lines() {
 }
 
 #[test]
+fn pty_terminal_reports_request_response_metrics() {
+    let manager = FerrousNativeManager::new();
+    let log_dir = test_log_dir("pty-terminal-bench");
+    let record = manager
+        .spawn_pty_blocking(base_pty_config(
+            vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "stty -echo; while IFS= read -r line; do printf 'pty-bench:%s\n' \"$line\"; done"
+                    .to_owned(),
+            ],
+            log_dir,
+        ))
+        .expect("spawn pty");
+
+    let request_count = 32;
+    let bench_started = Instant::now();
+    let mut latencies = Vec::new();
+    for id in 1..=request_count {
+        let request = format!("terminal-request-{id}");
+        let started = Instant::now();
+        manager
+            .write_line_blocking(&record.id, &request)
+            .expect("write pty request");
+        let mut response = String::new();
+        for _ in 0..8 {
+            let Some(line) = manager
+                .read_line_blocking(&record.id, Duration::from_secs(3))
+                .expect("read pty response")
+            else {
+                continue;
+            };
+            if line.starts_with("pty-bench:") {
+                response = line;
+                break;
+            }
+        }
+        latencies.push(started.elapsed());
+        assert_eq!(response, format!("pty-bench:{request}"));
+    }
+
+    let total_elapsed = bench_started.elapsed();
+    let stats = duration_stats(&latencies);
+    eprintln!(
+        "ferrous_native_pty_terminal_rr requests={} elapsed_ms={:.3} throughput_rps={:.1} min_ms={:.3} p50_ms={:.3} p95_ms={:.3} max_ms={:.3}",
+        request_count,
+        total_elapsed.as_secs_f64() * 1000.0,
+        request_count as f64 / total_elapsed.as_secs_f64(),
+        stats.min_ms,
+        stats.p50_ms,
+        stats.p95_ms,
+        stats.max_ms,
+    );
+
+    assert!(
+        manager
+            .terminate_shell_blocking(&record.id)
+            .expect("terminate shell")
+    );
+}
+
+#[test]
 fn read_line_times_out_without_output() {
     let manager = FerrousNativeManager::new();
     let log_dir = test_log_dir("pipe-timeout");

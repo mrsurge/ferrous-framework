@@ -115,3 +115,9 @@ The native pipe tests include JSON-RPC-shaped request/response coverage with int
 ```sh
 cargo test pipe_ -- --nocapture
 ```
+
+The PTY terminal path has a focused request/response timing smoke:
+
+```sh
+cargo test pty_terminal -- --nocapture
+```
