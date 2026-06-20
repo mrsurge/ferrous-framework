@@ -1,6 +1,6 @@
 [package]
 name = "ferrous_framework"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/mrsurge/ferrous-framework"
@@ -9,10 +9,13 @@ description = "Rust runtime path for framework-shells-compatible process managem
 
 [dependencies]
 anyhow = "1"
+axum = "0.8"
 getrandom = "0.3"
+hmac = "0.12"
 nix = { version = "0.30", features = ["fs", "poll", "process", "term"] }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 shlex = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time"] }

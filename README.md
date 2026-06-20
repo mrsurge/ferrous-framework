@@ -27,6 +27,9 @@ Current native API:
 - `FerrousNativeShellRecord`
 - `FerrousNativeShellStatus`
 - `FerrousNativeShellCapabilities`
+- `FerrousNativeHost`
+- `FerrousNativeHostConfig`
+- `derive_native_api_token`
 - `load_persisted_record`
 - `shellspec::render_shellspec_entry`
 - `FerrousNativeManager::spawn_shellspec_entry_blocking`
@@ -57,6 +60,29 @@ Fresh managers can load sidecar records from the canonical store logs directory.
 
 Capability records distinguish logs, live output reads, output subscriptions, stdin write, stdin EOF, terminate, and resize explicitly. PTY shells expose `resize_pty_blocking(...)` through the native manager. Adopted/stale records clear live-only controls even if the persisted record was created by a live owner.
 
+## Native Host / Control Plane
+
+`FerrousNativeHost` is the first Rust-owned FWS host MVP. It runs an Axum/Tokio HTTP server around `FerrousNativeManager` and does not depend on Python.
+
+Current host surfaces:
+
+- `GET /health`
+- `GET /fws`
+- `GET /api/framework_shells/runtime`
+- `GET /api/framework_shells`
+- `POST /api/framework_shells`
+- `POST /api/framework_shells/shellspec/apply`
+- `GET /api/framework_shells/{shell_id}`
+- `POST /api/framework_shells/{shell_id}/terminate`
+- `POST /api/framework_shells/{shell_id}/action`
+- `POST /api/framework_shells/{shell_id}/input`
+- `POST /api/framework_shells/app/{app_id}/shutdown`
+- `GET /api/framework_shells/logs/{shell_id}/tail`
+
+Mutating routes require the same API token shape as Python FWS: `HMAC(secret, "api")`, passed as `X-Framework-Key` or `Authorization: Bearer ...`. `derive_native_api_token(...)` exposes that token derivation for Rust callers and tests.
+
+The MVP host reports `socketio: false`; it is an HTTP/dashboard/control-plane root, not a Socket.IO-compatible peer lane yet. Group shutdown currently terminates Ferrous-owned live shell roots for the derived app/group id and returns the shutdown DTO shape.
+
 ## FWS Environment Contract
 
 `FerrousNativeManager::new()` derives the FWS child environment from the current process:
@@ -67,6 +93,8 @@ Capability records distinguish logs, live output reads, output subscriptions, st
 - `TE_FRAMEWORK_URL`
 
 If `FRAMEWORK_SHELLS_SECRET` is absent, Ferrous follows the FWS CLI bootstrap shape: it loads `runtimes/<repo_fingerprint>/secret` when present, otherwise generates a `temporary_secret_<hex>` value and stores it there with owner-only permissions where supported. If `FRAMEWORK_SHELLS_RUN_ID` is absent, Ferrous generates a native run id. URL values are optional until a host/dashboard runtime is attached.
+
+When `FerrousNativeHost::spawn(...)` creates the manager, it sets `TE_FRAMEWORK_URL` to the bound host URL when the value is otherwise absent. The MVP host intentionally does not set `FRAMEWORK_SHELLS_FWS_SOCKETIO_URL` until a real Socket.IO-compatible lane exists.
 
 For explicit host control, construct the manager with `FerrousNativeManager::with_env(FerrousNativeEnv { ... })`. Every native `proc`, `pipe`, and `pty` spawn receives that overlay, then the shell config `env` is applied last so shell-specific overrides still work.
 

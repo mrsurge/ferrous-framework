@@ -1,7 +1,8 @@
 use anyhow::{Result, anyhow};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct FerrousShutdownStats {
     pub total: u64,
     pub terminated: u64,
@@ -10,7 +11,7 @@ pub struct FerrousShutdownStats {
     pub errors: Vec<String>,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct FerrousShutdownResult {
     pub ok: bool,
     pub kind: String,

@@ -2,6 +2,7 @@ use crate::shellspec::{
     RenderedReadinessProbe, RenderedShellSpec, ShellspecRenderInput, render_shellspec_entries,
     render_shellspec_entry,
 };
+use crate::shutdown::{FerrousShutdownResult, FerrousShutdownStats};
 use anyhow::{Context, Result, anyhow, bail};
 use nix::{
     fcntl::{FcntlArg, OFlag, fcntl},
@@ -1054,6 +1055,72 @@ impl FerrousNativeManager {
             }
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    pub fn shutdown_app_group_blocking(&self, app_id: &str) -> Result<FerrousShutdownResult> {
+        let started_at_ms = now_ms() as u64;
+        let targets = self
+            .live_records()?
+            .into_iter()
+            .filter(|record| {
+                record.status == FerrousNativeShellStatus::Running
+                    && record.app_id.as_deref() == Some(app_id)
+            })
+            .collect::<Vec<_>>();
+        let root_pids = targets
+            .iter()
+            .map(|record| i64::from(record.pid))
+            .collect::<Vec<_>>();
+        let mut stats = FerrousShutdownStats {
+            total: targets.len() as u64,
+            ..FerrousShutdownStats::default()
+        };
+        let mut events = Vec::new();
+        for record in targets {
+            match self.terminate_shell_blocking(&record.id) {
+                Ok(true) => {
+                    stats.terminated += 1;
+                    events.push(format!("terminated shell {}", record.id));
+                    match self.wait_shell_blocking(&record.id, Duration::from_secs(2)) {
+                        Ok(Some(exited)) if exited.status == FerrousNativeShellStatus::Exited => {
+                            stats.force_killed += 1;
+                        }
+                        Ok(_) => {
+                            stats.force_killed += 1;
+                            events.push(format!(
+                                "shell {} did not report exit before timeout",
+                                record.id
+                            ));
+                        }
+                        Err(error) => {
+                            stats.errors.push(format!("{}: {}", record.id, error));
+                        }
+                    }
+                }
+                Ok(false) => {
+                    stats.errors.push(format!("{}: not live", record.id));
+                }
+                Err(error) => {
+                    stats.errors.push(format!("{}: {}", record.id, error));
+                }
+            }
+        }
+        let ended_at_ms = now_ms() as u64;
+        Ok(FerrousShutdownResult {
+            ok: stats.errors.is_empty(),
+            kind: "shutdown_group".to_owned(),
+            target: app_id.to_owned(),
+            started_at_ms,
+            ended_at_ms,
+            elapsed_ms: ended_at_ms.saturating_sub(started_at_ms),
+            root_pids,
+            stats,
+            events,
+            note: Some(
+                "Ferrous MVP group shutdown terminates Ferrous-owned live shell roots only"
+                    .to_owned(),
+            ),
+        })
     }
 
     fn output_for(&self, shell_id: &str) -> Result<Option<Arc<Mutex<DirectOutput>>>> {
