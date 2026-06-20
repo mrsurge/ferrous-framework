@@ -3,7 +3,8 @@ pub mod shellspec;
 pub mod shutdown;
 
 pub use native_runtime::{
-    FerrousNativeEnv, FerrousNativeManager, FerrousNativePipeConfig, FerrousNativeProcConfig,
+    FerrousNativeEnv, FerrousNativeManager, FerrousNativeOutputChunk, FerrousNativeOutputStream,
+    FerrousNativeOutputSubscription, FerrousNativePipeConfig, FerrousNativeProcConfig,
     FerrousNativePtyConfig, FerrousNativeShellCapabilities, FerrousNativeShellRecord,
     FerrousNativeShellStatus, FerrousNativeStore, load_persisted_record,
 };

@@ -42,13 +42,15 @@ The `pipe` and `pty` hot paths are direct fd paths. They do not use a Python bri
 
 Passive log capture and child exit status are owned by one manager reactor thread instead of per-stream/per-shell helper threads. Pipe and PTY stdout remain caller-driven direct reads; the reactor handles proc stdout/stderr, pipe stderr, and child status persistence.
 
+Output subscription is available through `subscribe_output(shell_id, stream, capacity)`. Subscriptions are bounded: if a subscriber does not drain its queue and a new chunk would exceed capacity, the runtime drops that subscriber instead of buffering unbounded output. Reactor-owned streams publish as they are logged; pipe/PTY stdout publish when the direct read path drains bytes.
+
 `FerrousNativeManager::new()` uses the same store layout as Python FWS: `FRAMEWORK_SHELLS_BASE_DIR` or `~/.cache/framework_shells`, `runtimes/<repo_fingerprint>/<runtime_id>/logs`, where `runtime_id` is `sha256(secret)[:16]`. If a spawn config leaves `log_dir` as `None`, logs and sidecar records are written into that canonical FWS logs directory. `Some(path)` remains an explicit override.
 
 Each native launch writes a sidecar record at `FerrousNativeShellRecord.record_path`, next to the stdout/stderr logs. The sidecar records command/backend/status/log paths/capabilities/run metadata and env keys, but does not persist env values or secrets.
 
 Fresh managers can load sidecar records from the canonical store logs directory. Loaded records are marked `adopted: true`, keep log/capability metadata for inspection, and deliberately clear live-only controls such as `stdin_write` and `terminate`.
 
-Capability records distinguish logs, live output reads, stdin write, stdin EOF, terminate, and resize explicitly. PTY shells expose `resize_pty_blocking(...)` through the native manager. Adopted/stale records clear live-only controls even if the persisted record was created by a live owner.
+Capability records distinguish logs, live output reads, output subscriptions, stdin write, stdin EOF, terminate, and resize explicitly. PTY shells expose `resize_pty_blocking(...)` through the native manager. Adopted/stale records clear live-only controls even if the persisted record was created by a live owner.
 
 ## FWS Environment Contract
 

@@ -1,6 +1,6 @@
 use ferrous_framework::{
-    FerrousNativeEnv, FerrousNativeManager, FerrousNativePipeConfig, FerrousNativeProcConfig,
-    FerrousNativePtyConfig, FerrousNativeShellStatus, FerrousNativeStore,
+    FerrousNativeEnv, FerrousNativeManager, FerrousNativeOutputStream, FerrousNativePipeConfig,
+    FerrousNativeProcConfig, FerrousNativePtyConfig, FerrousNativeShellStatus, FerrousNativeStore,
     shellspec::ShellspecRenderInput,
 };
 use serde_json::{Value, json};
@@ -129,6 +129,8 @@ fn spawns_proc_and_captures_stdout_stderr_logs() {
     assert!(!record.capabilities.stdin_eof);
     assert!(record.capabilities.stdout_log);
     assert!(record.capabilities.stderr_log);
+    assert!(record.capabilities.stdout_subscribe);
+    assert!(record.capabilities.stderr_subscribe);
     assert!(!record.capabilities.output_read);
     assert!(record.capabilities.terminate);
     assert!(!record.capabilities.resize);
@@ -609,6 +611,8 @@ fn fresh_manager_lists_persisted_records_as_adopted_stale_records() {
     assert!(!loaded.capabilities.output_read);
     assert!(!loaded.capabilities.resize);
     assert!(loaded.capabilities.stdout_log);
+    assert!(!loaded.capabilities.stdout_subscribe);
+    assert!(!loaded.capabilities.stderr_subscribe);
     assert!(loaded.env.is_empty());
     assert!(
         loaded
@@ -687,6 +691,8 @@ fn pipe_writes_stdin_and_reads_stdout_lines() {
     assert!(record.capabilities.stdin_write);
     assert!(record.capabilities.stdin_eof);
     assert!(record.capabilities.output_read);
+    assert!(record.capabilities.stdout_subscribe);
+    assert!(record.capabilities.stderr_subscribe);
     assert!(!record.capabilities.resize);
     assert!(
         manager
@@ -773,6 +779,8 @@ fn pty_writes_stdin_and_reads_output_lines() {
     assert!(record.capabilities.stdin_write);
     assert!(record.capabilities.stdin_eof);
     assert!(record.capabilities.output_read);
+    assert!(record.capabilities.stdout_subscribe);
+    assert!(!record.capabilities.stderr_subscribe);
     assert!(record.capabilities.resize);
     assert!(
         manager
@@ -845,6 +853,173 @@ fn proc_rejects_line_io() {
         .resize_pty_blocking(&record.id, 80, 24)
         .expect_err("proc resize must fail");
     assert!(error.to_string().contains("does not expose PTY resize"));
+}
+
+#[test]
+fn proc_stdout_subscription_receives_reactor_chunks() {
+    let manager = FerrousNativeManager::new();
+    let log_dir = test_log_dir("proc-stdout-subscribe");
+    let record = manager
+        .spawn_proc_blocking(base_proc_config(
+            vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "sleep 0.1; printf subscribed-stdout".to_owned(),
+            ],
+            log_dir,
+        ))
+        .expect("spawn proc");
+    let subscription = manager
+        .subscribe_output(&record.id, FerrousNativeOutputStream::Stdout, 4)
+        .expect("subscribe stdout")
+        .expect("stdout subscription");
+    let chunk = subscription
+        .recv_timeout(Duration::from_secs(3))
+        .expect("recv stdout chunk")
+        .expect("stdout chunk");
+    assert_eq!(chunk.shell_id, record.id);
+    assert_eq!(chunk.stream, FerrousNativeOutputStream::Stdout);
+    assert_eq!(String::from_utf8_lossy(&chunk.bytes), "subscribed-stdout");
+    assert_eq!(chunk.dropped_before, 0);
+}
+
+#[test]
+fn output_subscription_drops_slow_subscribers_when_full() {
+    let manager = FerrousNativeManager::new();
+    let log_dir = test_log_dir("subscription-backpressure");
+    let record = manager
+        .spawn_proc_blocking(base_proc_config(
+            vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "sleep 0.1; printf first; sleep 0.2; printf second; sleep 0.2; printf third"
+                    .to_owned(),
+            ],
+            log_dir,
+        ))
+        .expect("spawn proc");
+    let subscription = manager
+        .subscribe_output(&record.id, FerrousNativeOutputStream::Stdout, 1)
+        .expect("subscribe stdout")
+        .expect("stdout subscription");
+    std::thread::sleep(Duration::from_millis(700));
+
+    let chunk = subscription
+        .recv_timeout(Duration::from_secs(1))
+        .expect("recv first chunk")
+        .expect("first chunk");
+    assert_eq!(String::from_utf8_lossy(&chunk.bytes), "first");
+    assert_eq!(
+        subscription.try_recv().expect("try receive after drop"),
+        None
+    );
+}
+
+#[test]
+fn pipe_stdout_subscription_receives_direct_read_chunks() {
+    let manager = FerrousNativeManager::new();
+    let log_dir = test_log_dir("pipe-stdout-subscribe");
+    let record = manager
+        .spawn_pipe_blocking(base_pipe_config(
+            vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "while IFS= read -r line; do printf 'sub:%s\n' \"$line\"; done".to_owned(),
+            ],
+            log_dir,
+        ))
+        .expect("spawn pipe");
+    let subscription = manager
+        .subscribe_output(&record.id, FerrousNativeOutputStream::Stdout, 4)
+        .expect("subscribe stdout")
+        .expect("stdout subscription");
+    manager
+        .write_line_blocking(&record.id, "direct")
+        .expect("write line");
+    let line = manager
+        .read_line_blocking(&record.id, Duration::from_secs(3))
+        .expect("read line")
+        .expect("line");
+    assert_eq!(line, "sub:direct");
+    let chunk = subscription
+        .recv_timeout(Duration::from_secs(3))
+        .expect("recv stdout chunk")
+        .expect("stdout chunk");
+    assert_eq!(chunk.stream, FerrousNativeOutputStream::Stdout);
+    assert!(String::from_utf8_lossy(&chunk.bytes).contains("sub:direct"));
+    assert!(
+        manager
+            .terminate_shell_blocking(&record.id)
+            .expect("terminate shell")
+    );
+}
+
+#[test]
+fn pipe_stderr_subscription_receives_reactor_chunks() {
+    let manager = FerrousNativeManager::new();
+    let log_dir = test_log_dir("pipe-stderr-subscribe");
+    let record = manager
+        .spawn_pipe_blocking(base_pipe_config(
+            vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "while IFS= read -r line; do printf 'err:%s\n' \"$line\" >&2; done".to_owned(),
+            ],
+            log_dir,
+        ))
+        .expect("spawn pipe");
+    let subscription = manager
+        .subscribe_output(&record.id, FerrousNativeOutputStream::Stderr, 4)
+        .expect("subscribe stderr")
+        .expect("stderr subscription");
+    manager
+        .write_line_blocking(&record.id, "reactor")
+        .expect("write line");
+    let chunk = subscription
+        .recv_timeout(Duration::from_secs(3))
+        .expect("recv stderr chunk")
+        .expect("stderr chunk");
+    assert_eq!(chunk.stream, FerrousNativeOutputStream::Stderr);
+    assert!(String::from_utf8_lossy(&chunk.bytes).contains("err:reactor"));
+    assert!(
+        manager
+            .terminate_shell_blocking(&record.id)
+            .expect("terminate shell")
+    );
+}
+
+#[test]
+fn subscription_rejects_unavailable_streams_and_zero_capacity() {
+    let manager = FerrousNativeManager::new();
+    let log_dir = test_log_dir("subscription-rejects");
+    let record = manager
+        .spawn_pty_blocking(base_pty_config(
+            vec!["sh".to_owned(), "-c".to_owned(), "sleep 30".to_owned()],
+            log_dir,
+        ))
+        .expect("spawn pty");
+    let error = manager
+        .subscribe_output(&record.id, FerrousNativeOutputStream::Stdout, 0)
+        .err()
+        .expect("zero capacity should fail");
+    assert!(error.to_string().contains("capacity"));
+    let error = manager
+        .subscribe_output(&record.id, FerrousNativeOutputStream::Stderr, 4)
+        .err()
+        .expect("pty stderr subscription should fail");
+    assert!(error.to_string().contains("subscription"));
+    assert_eq!(
+        manager
+            .subscribe_output("missing-shell", FerrousNativeOutputStream::Stdout, 4)
+            .expect("missing shell should not error")
+            .is_none(),
+        true
+    );
+    assert!(
+        manager
+            .terminate_shell_blocking(&record.id)
+            .expect("terminate shell")
+    );
 }
 
 #[test]
