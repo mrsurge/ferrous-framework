@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     env,
-    fs::{File, OpenOptions, create_dir_all, read_dir, read_to_string, rename},
+    fs::{File, OpenOptions, create_dir_all, metadata, read_dir, read_to_string, rename},
     io::{BufWriter, Read, Write},
     net::{TcpStream, ToSocketAddrs},
     os::fd::{AsFd, AsRawFd, BorrowedFd},
@@ -34,6 +34,11 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+const FRAMEWORK_SHELLS_SECRET_KEY: &str = "FRAMEWORK_SHELLS_SECRET";
+const FRAMEWORK_SHELLS_RUN_ID_KEY: &str = "FRAMEWORK_SHELLS_RUN_ID";
+const FRAMEWORK_SHELLS_FWS_SOCKETIO_URL_KEY: &str = "FRAMEWORK_SHELLS_FWS_SOCKETIO_URL";
+const TE_FRAMEWORK_URL_KEY: &str = "TE_FRAMEWORK_URL";
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -77,6 +82,28 @@ pub struct FerrousNativeOutputChunk {
     pub stream: FerrousNativeOutputStream,
     pub bytes: Vec<u8>,
     pub dropped_before: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct FerrousNativePipeState {
+    pub shell_id: String,
+    pub backend: String,
+    pub pid: u32,
+    pub status: FerrousNativeShellStatus,
+    pub stdin_supported: bool,
+    pub stdout_bytes_seen: u64,
+    pub stderr_bytes_seen: u64,
+    pub capabilities: FerrousNativeShellCapabilities,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct FerrousShellInputResult {
+    pub shell_id: String,
+    pub backend: String,
+    pub accepted: bool,
+    pub bytes_written: usize,
+    pub newline_appended: bool,
+    pub eof_sent: bool,
 }
 
 pub struct FerrousNativeOutputSubscription {
@@ -179,6 +206,23 @@ pub struct FerrousNativePtyConfig {
     pub mode: FerrousNativePtyMode,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct FerrousPipeConfig {
+    pub command: Vec<String>,
+    pub cwd: Option<PathBuf>,
+    pub env: HashMap<String, String>,
+    pub label: String,
+    pub spec_id: String,
+    pub subgroups: Vec<String>,
+    pub log_dir: Option<PathBuf>,
+    pub shellspec_path: Option<PathBuf>,
+    pub shellspec_entry: Option<String>,
+    pub backend: Option<String>,
+    pub ctx: HashMap<String, String>,
+    pub python_module: Option<String>,
+    pub python_class: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct FerrousNativeManager {
     state: Arc<Mutex<ManagerState>>,
@@ -186,6 +230,12 @@ pub struct FerrousNativeManager {
     reactor: NativeRuntimeReactor,
     store: FerrousNativeStore,
     native_env: FerrousNativeEnv,
+}
+
+#[derive(Clone)]
+pub struct FerrousFrameworkPipe {
+    manager: FerrousNativeManager,
+    shell_id: String,
 }
 
 #[derive(Default)]
@@ -375,6 +425,16 @@ impl FerrousNativeManager {
         Self::with_store_and_env(store, native_env)
     }
 
+    pub fn try_with_env_map(env_map: &HashMap<String, String>) -> Result<Self> {
+        let store = FerrousNativeStore::from_env_map(env_map)?;
+        let native_env = FerrousNativeEnv::from_env_map_with_secret(env_map, store.secret.clone());
+        Ok(Self::with_store_and_env(store, native_env))
+    }
+
+    pub fn with_env_map(env_map: &HashMap<String, String>) -> Self {
+        Self::try_with_env_map(env_map).expect("failed to initialize native FWS store from env map")
+    }
+
     pub fn with_store_and_env(store: FerrousNativeStore, native_env: FerrousNativeEnv) -> Self {
         let state = Arc::new(Mutex::new(ManagerState::default()));
         let subscriptions = Arc::new(Mutex::new(OutputSubscriptions::default()));
@@ -404,6 +464,87 @@ impl FerrousNativeManager {
         self.native_env.child_env_overlay()
     }
 
+    pub async fn spawn_shell(
+        &self,
+        config: FerrousNativeProcConfig,
+    ) -> Result<FerrousNativeShellRecord> {
+        let manager = self.clone();
+        tokio::task::spawn_blocking(move || manager.spawn_proc_blocking(config))
+            .await
+            .context("native proc spawn task failed")?
+    }
+
+    pub async fn spawn_shell_pipe(
+        &self,
+        config: FerrousNativePipeConfig,
+    ) -> Result<FerrousNativeShellRecord> {
+        let manager = self.clone();
+        tokio::task::spawn_blocking(move || manager.spawn_pipe_blocking(config))
+            .await
+            .context("native pipe spawn task failed")?
+    }
+
+    pub async fn spawn_shell_pty(
+        &self,
+        config: FerrousNativePtyConfig,
+    ) -> Result<FerrousNativeShellRecord> {
+        let manager = self.clone();
+        tokio::task::spawn_blocking(move || manager.spawn_pty_blocking(config))
+            .await
+            .context("native PTY spawn task failed")?
+    }
+
+    pub async fn write_to_pipe(&self, shell_id: &str, data: &str) -> Result<()> {
+        let manager = self.clone();
+        let shell_id = shell_id.to_owned();
+        let data = data.as_bytes().to_vec();
+        tokio::task::spawn_blocking(move || manager.write_to_pipe_blocking(&shell_id, &data))
+            .await
+            .context("native pipe write task failed")?
+    }
+
+    pub async fn write_to_shell(
+        &self,
+        shell_id: &str,
+        data: &str,
+        append_newline: bool,
+    ) -> Result<FerrousShellInputResult> {
+        let manager = self.clone();
+        let shell_id = shell_id.to_owned();
+        let data = data.to_owned();
+        tokio::task::spawn_blocking(move || {
+            manager.write_to_shell_blocking(&shell_id, &data, append_newline)
+        })
+        .await
+        .context("native shell write task failed")?
+    }
+
+    pub async fn send_shell_eof(&self, shell_id: &str) -> Result<FerrousShellInputResult> {
+        let manager = self.clone();
+        let shell_id = shell_id.to_owned();
+        tokio::task::spawn_blocking(move || manager.send_shell_eof_blocking(&shell_id))
+            .await
+            .context("native shell EOF task failed")?
+    }
+
+    pub async fn terminate_shell(&self, shell_id: &str, force: bool) -> Result<()> {
+        let manager = self.clone();
+        let shell_id = shell_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            manager.terminate_shell_strict_blocking(&shell_id, force)
+        })
+        .await
+        .context("native shell terminate task failed")?
+    }
+
+    pub async fn subscribe_output_bytes(
+        &self,
+        shell_id: &str,
+        capacity: usize,
+    ) -> Result<Option<FerrousNativeOutputSubscription>> {
+        self.subscribe_output(shell_id, FerrousNativeOutputStream::Stdout, capacity)
+    }
+
     pub fn spawn_shellspec_entry_blocking(
         &self,
         document: &Value,
@@ -418,6 +559,14 @@ impl FerrousNativeManager {
         &self,
         spec: RenderedShellSpec,
     ) -> Result<FerrousNativeShellRecord> {
+        self.spawn_rendered_shellspec_with_log_dir_blocking(spec, None)
+    }
+
+    pub fn spawn_rendered_shellspec_with_log_dir_blocking(
+        &self,
+        spec: RenderedShellSpec,
+        log_dir: Option<PathBuf>,
+    ) -> Result<FerrousNativeShellRecord> {
         if !spec.autostart {
             bail!("shellspec '{}' has autostart=false", spec.id);
         }
@@ -430,7 +579,7 @@ impl FerrousNativeManager {
                 label: spec.id.clone(),
                 spec_id: spec.id,
                 subgroups: spec.subgroups,
-                log_dir: None,
+                log_dir: log_dir.clone(),
             }),
             "pipe" => self.spawn_pipe_blocking(FerrousNativePipeConfig {
                 command: spec.command,
@@ -439,7 +588,7 @@ impl FerrousNativeManager {
                 label: spec.id.clone(),
                 spec_id: spec.id,
                 subgroups: spec.subgroups,
-                log_dir: None,
+                log_dir: log_dir.clone(),
             }),
             "pty" => self.spawn_pty_blocking(FerrousNativePtyConfig {
                 command: spec.command,
@@ -448,7 +597,7 @@ impl FerrousNativeManager {
                 label: spec.id.clone(),
                 spec_id: spec.id,
                 subgroups: spec.subgroups,
-                log_dir: None,
+                log_dir,
                 mode: parse_pty_mode(&spec.pty_mode)?,
             }),
             backend => bail!("unsupported native shellspec backend '{backend}'"),
@@ -880,6 +1029,32 @@ impl FerrousNativeManager {
         Ok(None)
     }
 
+    pub fn get_pipe_state(&self, shell_id: &str) -> Result<Option<FerrousNativePipeState>> {
+        let (record, stdin_supported) = {
+            let state = self.lock_state()?;
+            let Some(entry) = state.entries.get(shell_id) else {
+                return Ok(None);
+            };
+            if entry.record.backend != "pipe" && entry.record.backend != "pty" {
+                return Ok(None);
+            }
+            (
+                entry.record.clone(),
+                entry.input.is_some() && entry.record.status == FerrousNativeShellStatus::Running,
+            )
+        };
+        Ok(Some(FerrousNativePipeState {
+            shell_id: record.id,
+            backend: record.backend,
+            pid: record.pid,
+            status: record.status,
+            stdin_supported,
+            stdout_bytes_seen: file_len(&record.stdout_log),
+            stderr_bytes_seen: file_len(&record.stderr_log),
+            capabilities: record.capabilities,
+        }))
+    }
+
     pub fn list_persisted_records(&self) -> Result<Vec<FerrousNativeShellRecord>> {
         list_persisted_records_in_dir(&self.store.logs_dir)
     }
@@ -915,9 +1090,22 @@ impl FerrousNativeManager {
         Ok(true)
     }
 
+    pub fn terminate_shell_strict_blocking(&self, shell_id: &str, _force: bool) -> Result<()> {
+        if self.terminate_shell_blocking(shell_id)? {
+            Ok(())
+        } else {
+            bail!("native shell {shell_id} not found or not live")
+        }
+    }
+
     pub fn write_line_blocking(&self, shell_id: &str, line: &str) -> Result<bool> {
         self.write_blocking(shell_id, line.as_bytes())?;
         self.write_blocking(shell_id, b"\n")
+    }
+
+    pub fn write_line_strict_blocking(&self, shell_id: &str, line: &str) -> Result<()> {
+        self.write_to_shell_blocking(shell_id, line, true)?;
+        Ok(())
     }
 
     pub fn write_blocking(&self, shell_id: &str, bytes: &[u8]) -> Result<bool> {
@@ -937,6 +1125,36 @@ impl FerrousNativeManager {
         input.write_all(bytes)?;
         input.flush()?;
         Ok(true)
+    }
+
+    pub fn write_to_pipe_blocking(&self, shell_id: &str, bytes: &[u8]) -> Result<()> {
+        if self.write_blocking(shell_id, bytes)? {
+            Ok(())
+        } else {
+            bail!("native shell {shell_id} not found or not live")
+        }
+    }
+
+    pub fn write_to_shell_blocking(
+        &self,
+        shell_id: &str,
+        data: &str,
+        append_newline: bool,
+    ) -> Result<FerrousShellInputResult> {
+        let backend = self.live_shell_backend(shell_id)?;
+        let mut bytes = data.as_bytes().to_vec();
+        if append_newline {
+            bytes.push(b'\n');
+        }
+        self.write_to_pipe_blocking(shell_id, &bytes)?;
+        Ok(FerrousShellInputResult {
+            shell_id: shell_id.to_owned(),
+            backend,
+            accepted: true,
+            bytes_written: bytes.len(),
+            newline_appended: append_newline,
+            eof_sent: false,
+        })
     }
 
     pub fn subscribe_output(
@@ -994,6 +1212,21 @@ impl FerrousNativeManager {
         };
         drop(input);
         Ok(true)
+    }
+
+    pub fn send_shell_eof_blocking(&self, shell_id: &str) -> Result<FerrousShellInputResult> {
+        let backend = self.live_shell_backend(shell_id)?;
+        if !self.send_stdin_eof_blocking(shell_id)? {
+            bail!("native shell {shell_id} not found or not live");
+        }
+        Ok(FerrousShellInputResult {
+            shell_id: shell_id.to_owned(),
+            backend,
+            accepted: true,
+            bytes_written: 0,
+            newline_appended: false,
+            eof_sent: true,
+        })
     }
 
     pub fn resize_pty_blocking(&self, shell_id: &str, cols: u16, rows: u16) -> Result<bool> {
@@ -1131,6 +1364,17 @@ impl FerrousNativeManager {
         Ok(entry.output.clone())
     }
 
+    fn live_shell_backend(&self, shell_id: &str) -> Result<String> {
+        let state = self.lock_state()?;
+        let Some(entry) = state.entries.get(shell_id) else {
+            bail!("native shell {shell_id} not found or not live");
+        };
+        if entry.record.status != FerrousNativeShellStatus::Running {
+            bail!("native shell {shell_id} is not running");
+        }
+        Ok(entry.record.backend.clone())
+    }
+
     fn live_running_record_by_spec_id(
         &self,
         spec_id: &str,
@@ -1203,10 +1447,61 @@ impl Default for FerrousNativeManager {
     }
 }
 
+impl FerrousFrameworkPipe {
+    pub fn spawn(config: FerrousPipeConfig) -> Result<Self> {
+        let manager = FerrousNativeManager::try_with_env_map(&config.env)?;
+        let record = spawn_compat_pipe(&manager, config)?;
+        wait_for_pipe_stdin_blocking(&manager, &record.id, Duration::from_secs(5))?;
+        Ok(Self {
+            manager,
+            shell_id: record.id,
+        })
+    }
+
+    pub fn shell_id(&self) -> Result<String> {
+        Ok(self.shell_id.clone())
+    }
+
+    pub fn write_line_blocking(&self, line: &str) -> Result<()> {
+        self.manager
+            .write_line_strict_blocking(&self.shell_id, line)
+    }
+
+    pub fn read_line_blocking(&self) -> Result<Option<String>> {
+        loop {
+            if let Some(line) = self
+                .manager
+                .read_line_blocking(&self.shell_id, Duration::from_millis(250))?
+            {
+                return Ok(Some(line));
+            }
+            let Some(record) = self.manager.get_shell(&self.shell_id)? else {
+                return Ok(None);
+            };
+            if record.status == FerrousNativeShellStatus::Exited {
+                return Ok(None);
+            }
+        }
+    }
+
+    pub fn close_blocking(&self) -> Result<()> {
+        self.manager
+            .terminate_shell_strict_blocking(&self.shell_id, true)
+    }
+}
+
+pub fn pyo3_embed_enabled() -> bool {
+    true
+}
+
+pub fn ferrous_native_enabled() -> bool {
+    true
+}
+
 impl FerrousNativeEnv {
     pub fn from_process_env() -> Self {
         Self::from_process_env_with_secret(read_env_or_else(
-            "FRAMEWORK_SHELLS_SECRET",
+            FRAMEWORK_SHELLS_SECRET_KEY,
             generate_secret,
         ))
     }
@@ -1214,22 +1509,47 @@ impl FerrousNativeEnv {
     pub fn from_process_env_with_secret(secret: String) -> Self {
         Self {
             secret,
-            run_id: read_env_or_else("FRAMEWORK_SHELLS_RUN_ID", generate_run_id),
-            fws_socketio_url: nonempty_env("FRAMEWORK_SHELLS_FWS_SOCKETIO_URL"),
-            te_framework_url: nonempty_env("TE_FRAMEWORK_URL"),
+            run_id: read_env_or_else(FRAMEWORK_SHELLS_RUN_ID_KEY, generate_run_id),
+            fws_socketio_url: nonempty_env(FRAMEWORK_SHELLS_FWS_SOCKETIO_URL_KEY),
+            te_framework_url: nonempty_env(TE_FRAMEWORK_URL_KEY),
+            extra: HashMap::new(),
+        }
+    }
+
+    pub fn from_env_map_with_secret(env_map: &HashMap<String, String>, secret: String) -> Self {
+        Self {
+            secret,
+            run_id: env_map
+                .get(FRAMEWORK_SHELLS_RUN_ID_KEY)
+                .filter(|value| !value.is_empty())
+                .cloned()
+                .unwrap_or_else(|| read_env_or_else(FRAMEWORK_SHELLS_RUN_ID_KEY, generate_run_id)),
+            fws_socketio_url: env_map
+                .get(FRAMEWORK_SHELLS_FWS_SOCKETIO_URL_KEY)
+                .filter(|value| !value.is_empty())
+                .cloned()
+                .or_else(|| nonempty_env(FRAMEWORK_SHELLS_FWS_SOCKETIO_URL_KEY)),
+            te_framework_url: env_map
+                .get(TE_FRAMEWORK_URL_KEY)
+                .filter(|value| !value.is_empty())
+                .cloned()
+                .or_else(|| nonempty_env(TE_FRAMEWORK_URL_KEY)),
             extra: HashMap::new(),
         }
     }
 
     pub fn child_env_overlay(&self) -> HashMap<String, String> {
         let mut out = self.extra.clone();
-        out.insert("FRAMEWORK_SHELLS_SECRET".to_owned(), self.secret.clone());
-        out.insert("FRAMEWORK_SHELLS_RUN_ID".to_owned(), self.run_id.clone());
+        out.insert(FRAMEWORK_SHELLS_SECRET_KEY.to_owned(), self.secret.clone());
+        out.insert(FRAMEWORK_SHELLS_RUN_ID_KEY.to_owned(), self.run_id.clone());
         if let Some(url) = &self.fws_socketio_url {
-            out.insert("FRAMEWORK_SHELLS_FWS_SOCKETIO_URL".to_owned(), url.clone());
+            out.insert(
+                FRAMEWORK_SHELLS_FWS_SOCKETIO_URL_KEY.to_owned(),
+                url.clone(),
+            );
         }
         if let Some(url) = &self.te_framework_url {
-            out.insert("TE_FRAMEWORK_URL".to_owned(), url.clone());
+            out.insert(TE_FRAMEWORK_URL_KEY.to_owned(), url.clone());
         }
         out
     }
@@ -1239,10 +1559,45 @@ impl FerrousNativeStore {
     pub fn from_process_env() -> Result<Self> {
         let base_dir = fws_base_dir()?;
         let repo_fingerprint = fws_repo_fingerprint()?;
-        let secret = match nonempty_env("FRAMEWORK_SHELLS_SECRET") {
+        let secret = match nonempty_env(FRAMEWORK_SHELLS_SECRET_KEY) {
             Some(secret) => {
                 persist_secret(&base_dir, &repo_fingerprint, &secret)?;
                 secret
+            }
+            None => match load_stored_secret(&base_dir, &repo_fingerprint)? {
+                Some(secret) => secret,
+                None => {
+                    let secret = generate_secret();
+                    persist_secret(&base_dir, &repo_fingerprint, &secret)?;
+                    secret
+                }
+            },
+        };
+        Self::from_base_fingerprint_secret(base_dir, repo_fingerprint, secret)
+    }
+
+    pub fn from_env_map(env_map: &HashMap<String, String>) -> Result<Self> {
+        let base_dir = match env_map
+            .get("FRAMEWORK_SHELLS_BASE_DIR")
+            .filter(|value| !value.is_empty())
+        {
+            Some(raw) => absolutize_path(expand_user(PathBuf::from(raw))?)?,
+            None => fws_base_dir()?,
+        };
+        let repo_fingerprint = match env_map
+            .get("FRAMEWORK_SHELLS_REPO_FINGERPRINT")
+            .filter(|value| !value.is_empty())
+        {
+            Some(value) => value.clone(),
+            None => fws_repo_fingerprint()?,
+        };
+        let secret = match env_map
+            .get(FRAMEWORK_SHELLS_SECRET_KEY)
+            .filter(|value| !value.is_empty())
+        {
+            Some(secret) => {
+                persist_secret(&base_dir, &repo_fingerprint, secret)?;
+                secret.clone()
             }
             None => match load_stored_secret(&base_dir, &repo_fingerprint)? {
                 Some(secret) => secret,
@@ -1305,6 +1660,134 @@ impl FerrousNativeStore {
             sockets_dir,
             secret_file,
         })
+    }
+}
+
+fn spawn_compat_pipe(
+    manager: &FerrousNativeManager,
+    config: FerrousPipeConfig,
+) -> Result<FerrousNativeShellRecord> {
+    let backend = config.backend.as_deref().unwrap_or("pipe");
+    if backend != "pipe" {
+        bail!("FerrousFrameworkPipe requires backend 'pipe', got '{backend}'");
+    }
+    if let Some(path) = &config.shellspec_path {
+        let document = load_shellspec_document(path)?;
+        let entry = choose_shellspec_entry(
+            &document,
+            config.shellspec_entry.as_deref(),
+            config.spec_id.as_str(),
+        )?;
+        let input = compat_render_input(&config)?;
+        let mut spec = render_shellspec_entry(&document, &entry, &input)?;
+        if spec.backend != "pipe" {
+            bail!(
+                "FerrousFrameworkPipe shellspec entry '{}' rendered backend '{}'",
+                spec.id,
+                spec.backend
+            );
+        }
+        let mut env = config.env;
+        env.extend(spec.env);
+        spec.env = env;
+        if spec.cwd.is_none() {
+            spec.cwd = config.cwd;
+        }
+        if spec.subgroups.is_empty() {
+            spec.subgroups = config.subgroups;
+        }
+        return manager.spawn_rendered_shellspec_with_log_dir_blocking(spec, config.log_dir);
+    }
+    manager.spawn_pipe_blocking(FerrousNativePipeConfig {
+        command: config.command,
+        cwd: config.cwd,
+        env: config.env,
+        label: nonempty_or(config.label, "ferrous-pipe"),
+        spec_id: nonempty_or(config.spec_id, "ferrous-pipe"),
+        subgroups: config.subgroups,
+        log_dir: config.log_dir,
+    })
+}
+
+fn load_shellspec_document(path: &Path) -> Result<Value> {
+    let raw = read_to_string(path)
+        .with_context(|| format!("failed to read shellspec {}", path.display()))?;
+    if path.extension().and_then(|value| value.to_str()) == Some("json") {
+        serde_json::from_str(&raw)
+            .with_context(|| format!("failed to parse shellspec JSON {}", path.display()))
+    } else {
+        serde_yaml::from_str(&raw)
+            .with_context(|| format!("failed to parse shellspec YAML {}", path.display()))
+    }
+}
+
+fn choose_shellspec_entry(
+    document: &Value,
+    requested: Option<&str>,
+    spec_id: &str,
+) -> Result<String> {
+    let shells = document
+        .get("shells")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("shellspec document missing shells object"))?;
+    if let Some(entry) = requested.filter(|value| !value.is_empty()) {
+        if shells.contains_key(entry) {
+            return Ok(entry.to_owned());
+        }
+        bail!("shellspec id '{entry}' not found");
+    }
+    if !spec_id.is_empty() && shells.contains_key(spec_id) {
+        return Ok(spec_id.to_owned());
+    }
+    shells
+        .keys()
+        .min()
+        .cloned()
+        .ok_or_else(|| anyhow!("shellspec document contains no shells"))
+}
+
+fn compat_render_input(config: &FerrousPipeConfig) -> Result<ShellspecRenderInput> {
+    let mut ctx = config.ctx.clone();
+    ctx.entry("PYTHON".to_owned())
+        .or_insert_with(|| config.command.first().cloned().unwrap_or_default());
+    let cwd = match &config.cwd {
+        Some(path) => path_to_string(path),
+        None => path_to_string(&env::current_dir().context("failed to read current directory")?),
+    };
+    ctx.entry("CWD".to_owned()).or_insert(cwd);
+    Ok(ShellspecRenderInput {
+        ctx,
+        env: config.env.clone(),
+    })
+}
+
+fn wait_for_pipe_stdin_blocking(
+    manager: &FerrousNativeManager,
+    shell_id: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(state) = manager.get_pipe_state(shell_id)? {
+            if state.stdin_supported {
+                return Ok(());
+            }
+            if state.status == FerrousNativeShellStatus::Exited {
+                bail!("native pipe {shell_id} exited before stdin became ready");
+            }
+        }
+        if Instant::now() >= deadline {
+            bail!("native pipe {shell_id} stdin never became ready");
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn nonempty_or(value: String, fallback: &str) -> String {
+    if value.is_empty() {
+        fallback.to_owned()
+    } else {
+        value
     }
 }
 
@@ -1377,6 +1860,10 @@ fn open_log(path: &PathBuf) -> Result<File> {
         .truncate(true)
         .open(path)
         .with_context(|| format!("failed to create log {}", path.display()))
+}
+
+fn file_len(path: &PathBuf) -> u64 {
+    metadata(path).map(|meta| meta.len()).unwrap_or_default()
 }
 
 fn record_path_for(log_dir: &std::path::Path, shell_id: &str) -> PathBuf {

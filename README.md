@@ -29,8 +29,14 @@ Current native API:
 - `FerrousNativeShellCapabilities`
 - `FerrousNativeHost`
 - `FerrousNativeHostConfig`
+- `FerrousFrameworkPipe`
+- `FerrousPipeConfig`
+- `FerrousNativePipeState`
+- `FerrousShellInputResult`
 - `derive_native_api_token`
 - `load_persisted_record`
+- `pyo3_embed_enabled`
+- `ferrous_native_enabled`
 - `shellspec::render_shellspec_entry`
 - `FerrousNativeManager::spawn_shellspec_entry_blocking`
 
@@ -51,6 +57,24 @@ The base native PTY backend is a raw PTY byte-stream backend. The JSONL-out / JS
 Passive log capture and child exit status are owned by one manager reactor thread instead of per-stream/per-shell helper threads. Pipe and PTY stdout remain caller-driven direct reads; the reactor handles proc stdout/stderr, pipe stderr, and child status persistence.
 
 Output subscription is available through `subscribe_output(shell_id, stream, capacity)`. Subscriptions are bounded: if a subscriber does not drain its queue and a new chunk would exceed capacity, the runtime drops that subscriber instead of buffering unbounded output. Reactor-owned streams publish as they are logged; pipe/PTY stdout publish when the direct read path drains bytes.
+
+The manager also exposes a Python-FWS-shaped async facade for downstream Rust callers that previously used the Python bridge shape:
+
+- `spawn_shell(...)`
+- `spawn_shell_pipe(...)`
+- `spawn_shell_pty(...)`
+- `get_pipe_state(...)`
+- `write_to_pipe(...)`
+- `write_to_shell(...)`
+- `send_shell_eof(...)`
+- `terminate_shell(...)`
+- `subscribe_output_bytes(...)`
+
+These methods are compatibility names over the same native runtime. They do not add JSON-RPC framing, app protocol routing, or Python networking behavior.
+
+For ALS-style pipe consumers, `FerrousFrameworkPipe::spawn(FerrousPipeConfig { ... })` provides the legacy blocking adapter shape: `shell_id()`, `write_line_blocking(...)`, `read_line_blocking()`, and `close_blocking()`. It is intentionally pipe-only. If a shellspec renders to a non-pipe backend, the adapter errors instead of pretending line-oriented pipe semantics are available.
+
+`pyo3_embed_enabled()` is retained as a legacy availability gate for older callers. In the native crate it reports the compatibility surface is available; it does not mean Python is in the runtime path. `ferrous_native_enabled()` is the literal native runtime capability flag.
 
 `FerrousNativeManager::new()` uses the same store layout as Python FWS: `FRAMEWORK_SHELLS_BASE_DIR` or `~/.cache/framework_shells`, `runtimes/<repo_fingerprint>/<runtime_id>/logs`, where `runtime_id` is `sha256(secret)[:16]`. If a spawn config leaves `log_dir` as `None`, logs and sidecar records are written into that canonical FWS logs directory. `Some(path)` remains an explicit override.
 
@@ -97,6 +121,8 @@ If `FRAMEWORK_SHELLS_SECRET` is absent, Ferrous follows the FWS CLI bootstrap sh
 When `FerrousNativeHost::spawn(...)` creates the manager, it sets `TE_FRAMEWORK_URL` to the bound host URL when the value is otherwise absent. The MVP host intentionally does not set `FRAMEWORK_SHELLS_FWS_SOCKETIO_URL` until a real Socket.IO-compatible lane exists.
 
 For explicit host control, construct the manager with `FerrousNativeManager::with_env(FerrousNativeEnv { ... })`. Every native `proc`, `pipe`, and `pty` spawn receives that overlay, then the shell config `env` is applied last so shell-specific overrides still work.
+
+When a caller already has an explicit FWS environment map, use `FerrousNativeManager::try_with_env_map(...)` or `with_env_map(...)`. The env map can supply `FRAMEWORK_SHELLS_BASE_DIR`, `FRAMEWORK_SHELLS_REPO_FINGERPRINT`, `FRAMEWORK_SHELLS_SECRET`, `FRAMEWORK_SHELLS_RUN_ID`, `FRAMEWORK_SHELLS_FWS_SOCKETIO_URL`, and `TE_FRAMEWORK_URL`; missing values fall back to the process environment and normal stored-secret bootstrap.
 
 ## Example
 

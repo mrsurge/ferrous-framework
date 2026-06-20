@@ -7,9 +7,11 @@ pub use native_host::{
     FerrousNativeHost, FerrousNativeHostConfig, derive_api_token as derive_native_api_token,
 };
 pub use native_runtime::{
-    FerrousNativeEnv, FerrousNativeManager, FerrousNativeOutputChunk, FerrousNativeOutputStream,
-    FerrousNativeOutputSubscription, FerrousNativePipeConfig, FerrousNativeProcConfig,
-    FerrousNativePtyConfig, FerrousNativePtyMode, FerrousNativeShellCapabilities,
-    FerrousNativeShellRecord, FerrousNativeShellStatus, FerrousNativeStore, load_persisted_record,
+    FerrousFrameworkPipe, FerrousNativeEnv, FerrousNativeManager, FerrousNativeOutputChunk,
+    FerrousNativeOutputStream, FerrousNativeOutputSubscription, FerrousNativePipeConfig,
+    FerrousNativePipeState, FerrousNativeProcConfig, FerrousNativePtyConfig, FerrousNativePtyMode,
+    FerrousNativeShellCapabilities, FerrousNativeShellRecord, FerrousNativeShellStatus,
+    FerrousNativeStore, FerrousPipeConfig, FerrousShellInputResult, ferrous_native_enabled,
+    load_persisted_record, pyo3_embed_enabled,
 };
 pub use shutdown::{FerrousShutdownResult, FerrousShutdownStats};

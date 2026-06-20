@@ -1,7 +1,8 @@
 use ferrous_framework::{
-    FerrousNativeEnv, FerrousNativeManager, FerrousNativeOutputStream, FerrousNativePipeConfig,
-    FerrousNativeProcConfig, FerrousNativePtyConfig, FerrousNativePtyMode,
-    FerrousNativeShellStatus, FerrousNativeStore, shellspec::ShellspecRenderInput,
+    FerrousFrameworkPipe, FerrousNativeEnv, FerrousNativeManager, FerrousNativeOutputStream,
+    FerrousNativePipeConfig, FerrousNativeProcConfig, FerrousNativePtyConfig, FerrousNativePtyMode,
+    FerrousNativeShellStatus, FerrousNativeStore, FerrousPipeConfig,
+    shellspec::ShellspecRenderInput,
 };
 use serde_json::{Value, json};
 use std::{
@@ -216,6 +217,122 @@ fn native_env_overlay_reaches_pipe_children() {
             .terminate_shell_blocking(&record.id)
             .expect("terminate shell")
     );
+}
+
+#[test]
+fn env_map_builder_uses_explicit_fws_store_and_child_env() {
+    let base_dir = test_log_dir("env-map-builder-base");
+    let env = HashMap::from([
+        (
+            "FRAMEWORK_SHELLS_BASE_DIR".to_owned(),
+            base_dir.to_string_lossy().into_owned(),
+        ),
+        (
+            "FRAMEWORK_SHELLS_REPO_FINGERPRINT".to_owned(),
+            "env_map_fingerprint".to_owned(),
+        ),
+        (
+            "FRAMEWORK_SHELLS_SECRET".to_owned(),
+            "secret-from-env-map".to_owned(),
+        ),
+        (
+            "FRAMEWORK_SHELLS_RUN_ID".to_owned(),
+            "run-from-env-map".to_owned(),
+        ),
+    ]);
+    let manager = FerrousNativeManager::try_with_env_map(&env).expect("manager from env map");
+    assert_eq!(manager.store().repo_fingerprint, "env_map_fingerprint");
+    assert_eq!(manager.native_env().secret, "secret-from-env-map");
+    assert_eq!(manager.native_env().run_id, "run-from-env-map");
+
+    let record = manager
+        .spawn_proc_blocking(FerrousNativeProcConfig {
+            command: vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "printf '%s|%s' \"$FRAMEWORK_SHELLS_SECRET\" \"$FRAMEWORK_SHELLS_RUN_ID\""
+                    .to_owned(),
+            ],
+            cwd: None,
+            env: HashMap::new(),
+            label: "env-map-proc".to_owned(),
+            spec_id: "env-map-proc".to_owned(),
+            subgroups: vec!["tests".to_owned()],
+            log_dir: None,
+        })
+        .expect("spawn proc");
+    let exited = manager
+        .wait_shell_blocking(&record.id, Duration::from_secs(3))
+        .expect("wait shell")
+        .expect("shell record");
+    assert_eq!(
+        eventually_read_to_string(&exited.stdout_log, Duration::from_secs(3)),
+        "secret-from-env-map|run-from-env-map"
+    );
+}
+
+#[test]
+fn async_manager_facade_matches_python_fws_pipe_shape() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    runtime.block_on(async {
+        let manager = test_manager_with_store("async-pipe-facade");
+        let record = manager
+            .spawn_shell_pipe(base_pipe_config(
+                vec![
+                    "sh".to_owned(),
+                    "-c".to_owned(),
+                    "while IFS= read -r line; do printf 'async:%s\\n' \"$line\"; done".to_owned(),
+                ],
+                test_log_dir("unused-async-pipe-facade"),
+            ))
+            .await
+            .expect("spawn pipe");
+        let state = manager
+            .get_pipe_state(&record.id)
+            .expect("pipe state")
+            .expect("live pipe state");
+        assert!(state.stdin_supported);
+        assert_eq!(state.backend, "pipe");
+
+        let result = manager
+            .write_to_shell(&record.id, "first", true)
+            .await
+            .expect("write shell");
+        assert!(result.accepted);
+        assert_eq!(result.bytes_written, "first\n".len());
+        assert!(result.newline_appended);
+        assert!(!result.eof_sent);
+        assert_eq!(
+            manager
+                .read_line_blocking(&record.id, Duration::from_secs(3))
+                .expect("read line"),
+            Some("async:first".to_owned())
+        );
+
+        manager
+            .write_to_pipe(&record.id, "second\n")
+            .await
+            .expect("write pipe");
+        assert_eq!(
+            manager
+                .read_line_blocking(&record.id, Duration::from_secs(3))
+                .expect("read line"),
+            Some("async:second".to_owned())
+        );
+
+        let error = manager
+            .write_to_pipe("missing-shell", "nope\n")
+            .await
+            .expect_err("missing shell should be strict error");
+        assert!(error.to_string().contains("not found"));
+        manager
+            .terminate_shell(&record.id, true)
+            .await
+            .expect("terminate shell");
+    });
 }
 
 #[test]
@@ -793,6 +910,107 @@ fn pipe_writes_stdin_and_reads_stdout_lines() {
             .terminate_shell_blocking(&record.id)
             .expect("terminate shell")
     );
+}
+
+#[test]
+fn ferrous_framework_pipe_wrapper_exposes_blocking_line_contract() {
+    let base_dir = test_log_dir("framework-pipe-base");
+    let pipe = FerrousFrameworkPipe::spawn(FerrousPipeConfig {
+        command: vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "while IFS= read -r line; do printf 'compat:%s\\n' \"$line\"; done".to_owned(),
+        ],
+        cwd: None,
+        env: HashMap::from([
+            (
+                "FRAMEWORK_SHELLS_BASE_DIR".to_owned(),
+                base_dir.to_string_lossy().into_owned(),
+            ),
+            (
+                "FRAMEWORK_SHELLS_REPO_FINGERPRINT".to_owned(),
+                "framework_pipe_wrapper".to_owned(),
+            ),
+            (
+                "FRAMEWORK_SHELLS_SECRET".to_owned(),
+                "framework-pipe-secret".to_owned(),
+            ),
+        ]),
+        label: "framework-pipe".to_owned(),
+        spec_id: "framework-pipe".to_owned(),
+        subgroups: vec!["tests".to_owned()],
+        log_dir: None,
+        ..FerrousPipeConfig::default()
+    })
+    .expect("spawn wrapper pipe");
+
+    assert!(!pipe.shell_id().expect("shell id").is_empty());
+    pipe.write_line_blocking("hello").expect("write line");
+    assert_eq!(
+        pipe.read_line_blocking().expect("read line"),
+        Some("compat:hello".to_owned())
+    );
+    pipe.close_blocking().expect("close pipe");
+    assert_eq!(pipe.read_line_blocking().expect("read after close"), None);
+}
+
+#[test]
+fn ferrous_framework_pipe_wrapper_loads_yaml_shellspec_and_merges_env() {
+    let dir = test_log_dir("framework-pipe-yaml");
+    let shellspec_path = dir.join("pipe.yaml");
+    fs::write(
+        &shellspec_path,
+        r#"
+version: "1"
+shells:
+  worker:
+    backend: pipe
+    command:
+      - sh
+      - -c
+      - 'while IFS= read -r line; do printf "%s:%s:%s\n" "$APP_ID" "$BASE_ONLY" "$line"; done'
+    env:
+      APP_ID: "${ctx:APP_ID}"
+    subgroups:
+      - "${ctx:APP_ID}"
+"#,
+    )
+    .expect("write shellspec");
+
+    let pipe = FerrousFrameworkPipe::spawn(FerrousPipeConfig {
+        command: vec!["python".to_owned()],
+        cwd: Some(dir.clone()),
+        env: HashMap::from([
+            (
+                "FRAMEWORK_SHELLS_BASE_DIR".to_owned(),
+                dir.join("fws-base").to_string_lossy().into_owned(),
+            ),
+            (
+                "FRAMEWORK_SHELLS_REPO_FINGERPRINT".to_owned(),
+                "framework_pipe_yaml".to_owned(),
+            ),
+            (
+                "FRAMEWORK_SHELLS_SECRET".to_owned(),
+                "framework-pipe-yaml-secret".to_owned(),
+            ),
+            ("BASE_ONLY".to_owned(), "base-env".to_owned()),
+        ]),
+        label: "ignored-for-shellspec".to_owned(),
+        spec_id: "worker".to_owned(),
+        subgroups: vec!["fallback".to_owned()],
+        shellspec_path: Some(shellspec_path),
+        shellspec_entry: Some("worker".to_owned()),
+        ctx: HashMap::from([("APP_ID".to_owned(), "ctx-app".to_owned())]),
+        ..FerrousPipeConfig::default()
+    })
+    .expect("spawn wrapper shellspec pipe");
+
+    pipe.write_line_blocking("ping").expect("write line");
+    assert_eq!(
+        pipe.read_line_blocking().expect("read line"),
+        Some("ctx-app:base-env:ping".to_owned())
+    );
+    pipe.close_blocking().expect("close pipe");
 }
 
 #[test]
