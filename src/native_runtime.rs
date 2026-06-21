@@ -40,6 +40,7 @@ const FRAMEWORK_SHELLS_SECRET_KEY: &str = "FRAMEWORK_SHELLS_SECRET";
 const FRAMEWORK_SHELLS_RUN_ID_KEY: &str = "FRAMEWORK_SHELLS_RUN_ID";
 const FRAMEWORK_SHELLS_FWS_SOCKETIO_URL_KEY: &str = "FRAMEWORK_SHELLS_FWS_SOCKETIO_URL";
 const TE_FRAMEWORK_URL_KEY: &str = "TE_FRAMEWORK_URL";
+const MAX_EXITED_SHELLS: usize = 50;
 static NEXT_GLOBAL_SHELL_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -1135,7 +1136,7 @@ impl FerrousNativeManager {
         for entry in state.entries.values() {
             records.insert(entry.record.id.clone(), entry.record.clone());
         }
-        Ok(records.into_values().collect())
+        Ok(limit_exited_shell_history(records.into_values().collect()))
     }
 
     pub fn get_shell(&self, shell_id: &str) -> Result<Option<FerrousNativeShellRecord>> {
@@ -2151,6 +2152,11 @@ pub fn load_persisted_record(path: impl AsRef<Path>) -> Result<FerrousNativeShel
         .or_else(|| derive_app_id(&label, &persisted.subgroups));
     let is_app_worker =
         persisted.is_app_worker || derive_is_app_worker(&label, &persisted.subgroups);
+    let pid = persisted.pid.unwrap_or_default();
+    let mut status = persisted.status.unwrap_or(FerrousNativeShellStatus::Exited);
+    if status == FerrousNativeShellStatus::Running && !pid_is_live(pid) {
+        status = FerrousNativeShellStatus::Exited;
+    }
     Ok(FerrousNativeShellRecord {
         id,
         backend,
@@ -2159,8 +2165,8 @@ pub fn load_persisted_record(path: impl AsRef<Path>) -> Result<FerrousNativeShel
         env: HashMap::new(),
         env_keys: persisted.env_keys,
         env_overrides: json_object_to_string_map(persisted.env_overrides),
-        pid: persisted.pid.unwrap_or_default(),
-        status: persisted.status.unwrap_or(FerrousNativeShellStatus::Exited),
+        pid,
+        status,
         exit_code: persisted.exit_code,
         label,
         spec_id,
@@ -2182,6 +2188,54 @@ pub fn load_persisted_record(path: impl AsRef<Path>) -> Result<FerrousNativeShel
         created_at_ms,
         updated_at_ms,
     })
+}
+
+fn pid_is_live(pid: u32) -> bool {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return false;
+    }
+    if let Some(state) = linux_proc_pid_state(pid) {
+        return !matches!(state, 'Z' | 'X');
+    }
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if result == 0 {
+        return true;
+    }
+    matches!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(code) if code == libc::EPERM
+    )
+}
+
+fn linux_proc_pid_state(pid: u32) -> Option<char> {
+    let stat = read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_, after_comm) = stat.rsplit_once(") ")?;
+    after_comm.chars().next()
+}
+
+fn limit_exited_shell_history(
+    records: Vec<FerrousNativeShellRecord>,
+) -> Vec<FerrousNativeShellRecord> {
+    let mut active = Vec::new();
+    let mut exited = Vec::new();
+    for record in records {
+        if record.status == FerrousNativeShellStatus::Exited {
+            exited.push(record);
+        } else {
+            active.push(record);
+        }
+    }
+    exited.sort_by(|left, right| {
+        right
+            .updated_at_ms
+            .cmp(&left.updated_at_ms)
+            .then_with(|| right.created_at_ms.cmp(&left.created_at_ms))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    exited.truncate(MAX_EXITED_SHELLS);
+    active.extend(exited);
+    active.sort_by(|left, right| left.id.cmp(&right.id));
+    active
 }
 
 fn parse_persisted_record_from_str(raw: &str) -> Result<PersistedNativeShellRecord> {

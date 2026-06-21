@@ -938,7 +938,7 @@ fn persisted_python_fws_record_with_trailing_junk_is_readable() {
     "TE_APP_ID": "file_editor_cm6",
     "TE_APP_WORKER_PORT": "42401"
   }},
-  "pid": 12345,
+  "pid": 99999999,
   "status": "running",
   "created_at": 1778486289.4786,
   "updated_at": 1778486289.5455,
@@ -972,8 +972,8 @@ fn persisted_python_fws_record_with_trailing_junk_is_readable() {
     assert_eq!(record.label, "app-worker:file_editor_cm6");
     assert_eq!(record.spec_id, "app:file_editor_cm6:app-worker");
     assert_eq!(record.backend, "proc");
-    assert_eq!(record.pid, 12345);
-    assert_eq!(record.status, FerrousNativeShellStatus::Running);
+    assert_eq!(record.pid, 99999999);
+    assert_eq!(record.status, FerrousNativeShellStatus::Exited);
     assert_eq!(record.app_id.as_deref(), Some("file_editor_cm6"));
     assert!(record.is_app_worker);
     assert_eq!(
@@ -984,6 +984,72 @@ fn persisted_python_fws_record_with_trailing_junk_is_readable() {
         Some("42401")
     );
     assert!(record.adopted);
+}
+
+#[test]
+fn persisted_running_record_with_live_pid_stays_running() {
+    let root = test_log_dir("live-persisted-record-read");
+    let metadata_dir = root.join("meta").join("fs_live_record");
+    fs::create_dir_all(&metadata_dir).expect("create metadata dir");
+    let record_path = metadata_dir.join("meta.json");
+    fs::write(
+        &record_path,
+        format!(
+            r#"{{
+  "id": "fs_live_record",
+  "command": ["sh", "-c", "sleep 30"],
+  "pid": {},
+  "status": "running",
+  "backend": "proc"
+}}"#,
+            std::process::id()
+        ),
+    )
+    .expect("write live persisted record");
+
+    let record = load_persisted_record(&record_path).expect("load live persisted record");
+    assert_eq!(record.status, FerrousNativeShellStatus::Running);
+    assert!(record.adopted);
+}
+
+#[test]
+fn list_shells_caps_persisted_exited_history_to_fifty() {
+    let manager = test_manager_with_store("persisted-exited-cap");
+    for index in 0..55 {
+        let shell_id = format!("fs_exited_{index:03}");
+        let metadata_dir = manager.store().metadata_dir.join(&shell_id);
+        fs::create_dir_all(&metadata_dir).expect("create metadata dir");
+        fs::write(
+            metadata_dir.join("meta.json"),
+            format!(
+                r#"{{
+  "id": "{shell_id}",
+  "command": ["sh", "-c", "true"],
+  "pid": 99999999,
+  "status": "exited",
+  "backend": "proc",
+  "created_at_ms": {index},
+  "updated_at_ms": {index}
+}}"#
+            ),
+        )
+        .expect("write exited record");
+    }
+
+    let listed = manager.list_shells().expect("list persisted shells");
+    let exited = listed
+        .iter()
+        .filter(|record| record.status == FerrousNativeShellStatus::Exited)
+        .collect::<Vec<_>>();
+    assert_eq!(exited.len(), 50);
+    let ids = exited
+        .iter()
+        .map(|record| record.id.as_str())
+        .collect::<Vec<_>>();
+    assert!(!ids.contains(&"fs_exited_000"));
+    assert!(!ids.contains(&"fs_exited_004"));
+    assert!(ids.contains(&"fs_exited_005"));
+    assert!(ids.contains(&"fs_exited_054"));
 }
 
 #[test]
