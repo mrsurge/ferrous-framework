@@ -686,7 +686,12 @@ async fn handle_browser_request(socket: SocketRef, request: Value, state: HostSt
             ),
         },
         "fws.exited.purge" => match purge_exited_records(&state) {
-            Ok(()) => json!({"jsonrpc": "2.0", "id": request_id, "result": {"ok": true}}),
+            Ok(removed_shell_ids) => {
+                for shell_id in &removed_shell_ids {
+                    emit_shell_removed(&state, shell_id).await;
+                }
+                json!({"jsonrpc": "2.0", "id": request_id, "result": {"ok": true}})
+            }
             Err(error) => jsonrpc_error(
                 request_id,
                 -32000,
@@ -740,7 +745,10 @@ async fn handle_browser_request(socket: SocketRef, request: Value, state: HostSt
                 );
             };
             match purge_shell_record(&state, shell_id) {
-                Ok(()) => json!({"jsonrpc": "2.0", "id": request_id, "result": {"ok": true}}),
+                Ok(()) => {
+                    emit_shell_removed(&state, shell_id).await;
+                    json!({"jsonrpc": "2.0", "id": request_id, "result": {"ok": true}})
+                }
                 Err(error) => jsonrpc_error(
                     request_id,
                     -32000,
@@ -1109,13 +1117,15 @@ fn truncate_log_file(path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn purge_exited_records(state: &HostState) -> Result<()> {
-    for record in state.manager.list_shells()? {
+fn purge_exited_records(state: &HostState) -> Result<Vec<String>> {
+    let mut removed_shell_ids = Vec::new();
+    for record in state.manager.list_persisted_records()? {
         if record.status == FerrousNativeShellStatus::Exited {
             purge_record_files(&record)?;
+            removed_shell_ids.push(record.id);
         }
     }
-    Ok(())
+    Ok(removed_shell_ids)
 }
 
 fn purge_shell_record(state: &HostState, shell_id: &str) -> Result<()> {
@@ -1136,6 +1146,24 @@ fn purge_record_files(record: &FerrousNativeShellRecord) -> Result<()> {
     }
     remove_file_if_exists(&record.record_path)?;
     Ok(())
+}
+
+async fn emit_shell_removed(state: &HostState, shell_id: &str) {
+    let Some(io) = &state.socketio else {
+        return;
+    };
+    let Some(ns) = io.of(FWS_SOCKETIO_NAMESPACE) else {
+        return;
+    };
+    let notification = FwsJsonRpcNotification {
+        jsonrpc: "2.0".to_owned(),
+        method: "fws.shell.removed".to_owned(),
+        params: json!({ "shell_id": shell_id }),
+    };
+    let _ = ns
+        .within(FWS_DASHBOARD_ROOM)
+        .emit(FWS_NOTIFICATION_EVENT, &notification)
+        .await;
 }
 
 fn remove_file_if_exists(path: &PathBuf) -> Result<()> {

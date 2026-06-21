@@ -2194,7 +2194,10 @@ fn pid_is_live(pid: u32) -> bool {
     if pid == 0 || pid > i32::MAX as u32 {
         return false;
     }
-    if let Some(state) = linux_proc_pid_state(pid) {
+    if Path::new("/proc").is_dir() {
+        let Some(state) = linux_proc_pid_state(pid) else {
+            return false;
+        };
         return !matches!(state, 'Z' | 'X');
     }
     let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
