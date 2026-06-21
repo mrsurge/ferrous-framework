@@ -288,18 +288,30 @@ struct SpawnRecordMetadata {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct PersistedNativeShellRecord {
     id: String,
-    spec_id: String,
-    backend: String,
+    #[serde(default)]
+    spec_id: Option<String>,
+    #[serde(default)]
+    backend: Option<String>,
+    #[serde(default)]
     command: Vec<String>,
+    #[serde(default)]
     cwd: Option<String>,
-    pid: u32,
-    status: FerrousNativeShellStatus,
+    #[serde(default)]
+    pid: Option<u32>,
+    #[serde(default)]
+    status: Option<FerrousNativeShellStatus>,
+    #[serde(default)]
     exit_code: Option<i32>,
-    label: String,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
     subgroups: Vec<String>,
-    record_path: String,
-    stdout_log: String,
-    stderr_log: String,
+    #[serde(default)]
+    record_path: Option<String>,
+    #[serde(default)]
+    stdout_log: Option<String>,
+    #[serde(default)]
+    stderr_log: Option<String>,
     #[serde(default)]
     io_metadata_log: Option<String>,
     #[serde(default)]
@@ -321,7 +333,7 @@ struct PersistedNativeShellRecord {
     #[serde(default)]
     run_id: Option<String>,
     #[serde(default)]
-    launcher_pid: u32,
+    launcher_pid: Option<u32>,
     #[serde(default)]
     env_keys: Vec<String>,
     #[serde(default)]
@@ -2107,7 +2119,7 @@ pub fn load_persisted_record(path: impl AsRef<Path>) -> Result<FerrousNativeShel
     let path = path.as_ref();
     let raw = read_to_string(path)
         .with_context(|| format!("failed to read native record {}", path.display()))?;
-    let persisted = serde_json::from_str::<PersistedNativeShellRecord>(&raw)
+    let persisted = parse_persisted_record_from_str(&raw)
         .with_context(|| format!("failed to parse native record {}", path.display()))?;
     let mut capabilities = persisted.capabilities;
     capabilities.stdin_write = false;
@@ -2119,26 +2131,43 @@ pub fn load_persisted_record(path: impl AsRef<Path>) -> Result<FerrousNativeShel
     capabilities.resize = false;
     let created_at_ms = coerce_ms_timestamp(persisted.created_at_ms, persisted.created_at);
     let updated_at_ms = coerce_ms_timestamp(persisted.updated_at_ms, persisted.updated_at);
+    let id = persisted.id;
+    let spec_id = persisted.spec_id.unwrap_or_else(|| id.clone());
+    let backend = persisted
+        .backend
+        .unwrap_or_else(|| infer_backend_from_flags(persisted.uses_pty, persisted.uses_pipes));
+    let label = persisted.label.unwrap_or_else(|| id.clone());
+    let record_path = persisted
+        .record_path
+        .unwrap_or_else(|| path_to_string(path));
+    let stdout_log = persisted.stdout_log.unwrap_or_else(|| {
+        sibling_log_path(path, &id, "stdout.log").unwrap_or_else(|| format!("{id}.stdout.log"))
+    });
+    let stderr_log = persisted.stderr_log.unwrap_or_else(|| {
+        sibling_log_path(path, &id, "stderr.log").unwrap_or_else(|| format!("{id}.stderr.log"))
+    });
     let app_id = persisted
         .app_id
-        .or_else(|| derive_app_id(&persisted.label, &persisted.subgroups));
+        .or_else(|| derive_app_id(&label, &persisted.subgroups));
+    let is_app_worker =
+        persisted.is_app_worker || derive_is_app_worker(&label, &persisted.subgroups);
     Ok(FerrousNativeShellRecord {
-        id: persisted.id,
-        backend: persisted.backend,
+        id,
+        backend,
         command: persisted.command,
         cwd: persisted.cwd.map(PathBuf::from),
         env: HashMap::new(),
         env_keys: persisted.env_keys,
         env_overrides: json_object_to_string_map(persisted.env_overrides),
-        pid: persisted.pid,
-        status: persisted.status,
+        pid: persisted.pid.unwrap_or_default(),
+        status: persisted.status.unwrap_or(FerrousNativeShellStatus::Exited),
         exit_code: persisted.exit_code,
-        label: persisted.label,
-        spec_id: persisted.spec_id,
+        label,
+        spec_id,
         subgroups: persisted.subgroups,
-        record_path: PathBuf::from(persisted.record_path),
-        stdout_log: PathBuf::from(persisted.stdout_log),
-        stderr_log: PathBuf::from(persisted.stderr_log),
+        record_path: PathBuf::from(record_path),
+        stdout_log: PathBuf::from(stdout_log),
+        stderr_log: PathBuf::from(stderr_log),
         io_metadata_log: persisted.io_metadata_log.map(PathBuf::from),
         pty_mode: persisted.pty_mode,
         autostart: persisted.autostart,
@@ -2147,12 +2176,41 @@ pub fn load_persisted_record(path: impl AsRef<Path>) -> Result<FerrousNativeShel
         runtime_id: persisted.runtime_id,
         app_id,
         parent_shell_id: persisted.parent_shell_id,
-        is_app_worker: persisted.is_app_worker,
+        is_app_worker,
         capabilities,
         adopted: true,
         created_at_ms,
         updated_at_ms,
     })
+}
+
+fn parse_persisted_record_from_str(raw: &str) -> Result<PersistedNativeShellRecord> {
+    let mut stream =
+        serde_json::Deserializer::from_str(raw).into_iter::<PersistedNativeShellRecord>();
+    match stream.next() {
+        Some(Ok(record)) => Ok(record),
+        Some(Err(error)) => Err(error).context("failed to parse persisted shell record"),
+        None => bail!("empty persisted shell record"),
+    }
+}
+
+fn infer_backend_from_flags(uses_pty: bool, uses_pipes: bool) -> String {
+    if uses_pipes {
+        "pipe".to_owned()
+    } else if uses_pty {
+        "pty".to_owned()
+    } else {
+        "proc".to_owned()
+    }
+}
+
+fn sibling_log_path(record_path: &Path, shell_id: &str, suffix: &str) -> Option<String> {
+    let runtime_root = record_path.parent()?.parent()?.parent()?;
+    Some(path_to_string(
+        &runtime_root
+            .join("logs")
+            .join(format!("{shell_id}.{suffix}")),
+    ))
 }
 
 fn list_persisted_records_in_dir(metadata_dir: &Path) -> Result<Vec<FerrousNativeShellRecord>> {
@@ -2176,7 +2234,13 @@ fn list_persisted_records_in_dir(metadata_dir: &Path) -> Result<Vec<FerrousNativ
         if !path.is_file() {
             continue;
         }
-        records.push(load_persisted_record(path)?);
+        match load_persisted_record(&path) {
+            Ok(record) => records.push(record),
+            Err(error) => eprintln!(
+                "[ferrous-framework] skipping unreadable FWS record {}: {error:#}",
+                path.display()
+            ),
+        }
     }
     records.sort_by(|left, right| left.id.cmp(&right.id));
     Ok(records)
@@ -2189,18 +2253,18 @@ fn persist_record(record: &FerrousNativeShellRecord, path: &std::path::Path) -> 
     }
     let persisted = PersistedNativeShellRecord {
         id: record.id.clone(),
-        spec_id: record.spec_id.clone(),
-        backend: record.backend.clone(),
+        spec_id: Some(record.spec_id.clone()),
+        backend: Some(record.backend.clone()),
         command: record.command.clone(),
         cwd: record.cwd.as_ref().map(path_to_string),
-        pid: record.pid,
-        status: record.status.clone(),
+        pid: Some(record.pid),
+        status: Some(record.status.clone()),
         exit_code: record.exit_code,
-        label: record.label.clone(),
+        label: Some(record.label.clone()),
         subgroups: record.subgroups.clone(),
-        record_path: path_to_string(&record.record_path),
-        stdout_log: path_to_string(&record.stdout_log),
-        stderr_log: path_to_string(&record.stderr_log),
+        record_path: Some(path_to_string(&record.record_path)),
+        stdout_log: Some(path_to_string(&record.stdout_log)),
+        stderr_log: Some(path_to_string(&record.stderr_log)),
         io_metadata_log: record.io_metadata_log.as_ref().map(path_to_string),
         pty_mode: record.pty_mode,
         autostart: record.autostart,
@@ -2211,7 +2275,7 @@ fn persist_record(record: &FerrousNativeShellRecord, path: &std::path::Path) -> 
         created_at: Some(ms_to_seconds(record.created_at_ms)),
         updated_at: Some(ms_to_seconds(record.updated_at_ms)),
         run_id: record.env.get("FRAMEWORK_SHELLS_RUN_ID").cloned(),
-        launcher_pid: std::process::id(),
+        launcher_pid: Some(std::process::id()),
         env_keys: record.env_keys.clone(),
         env_overrides: string_map_to_json_object(&record.env_overrides),
         uses_pty: record.backend == "pty",
@@ -2239,8 +2303,8 @@ fn persist_record(record: &FerrousNativeShellRecord, path: &std::path::Path) -> 
     Ok(())
 }
 
-fn path_to_string(path: &std::path::PathBuf) -> String {
-    path.to_string_lossy().into_owned()
+fn path_to_string(path: impl AsRef<Path>) -> String {
+    path.as_ref().to_string_lossy().into_owned()
 }
 
 fn sorted_env_keys(env: &HashMap<String, String>) -> Vec<String> {

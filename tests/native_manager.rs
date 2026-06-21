@@ -2,7 +2,7 @@ use ferrous_framework::{
     FerrousFrameworkPipe, FerrousNativeEnv, FerrousNativeManager, FerrousNativeOutputStream,
     FerrousNativePipeConfig, FerrousNativeProcConfig, FerrousNativePtyConfig, FerrousNativePtyMode,
     FerrousNativeShellStatus, FerrousNativeStore, FerrousPipeConfig, FerrousShellLaunchOverrides,
-    shellspec::ShellspecRenderInput,
+    load_persisted_record, shellspec::ShellspecRenderInput,
 };
 use serde_json::{Value, json};
 use std::{
@@ -909,6 +909,81 @@ fn shellspec_apply_prunes_live_specs_not_in_desired_set() {
         .expect("wait shell")
         .expect("shell record");
     assert_eq!(exited.status, FerrousNativeShellStatus::Exited);
+}
+
+#[test]
+fn persisted_python_fws_record_with_trailing_junk_is_readable() {
+    let root = test_log_dir("python-fws-record-read");
+    let metadata_dir = root.join("meta").join("fs_python_record");
+    let logs_dir = root.join("logs");
+    fs::create_dir_all(&metadata_dir).expect("create metadata dir");
+    fs::create_dir_all(&logs_dir).expect("create logs dir");
+    let record_path = metadata_dir.join("meta.json");
+    let stdout_log = logs_dir.join("fs_python_record.stdout.log");
+    let stderr_log = logs_dir.join("fs_python_record.stderr.log");
+    fs::write(&stdout_log, "").expect("stdout log");
+    fs::write(&stderr_log, "").expect("stderr log");
+    fs::write(
+        &record_path,
+        format!(
+            r#"{{
+  "id": "fs_python_record",
+  "spec_id": "app:file_editor_cm6:app-worker",
+  "command": ["python", "-m", "app.libs.app_worker"],
+  "label": "app-worker:file_editor_cm6",
+  "subgroups": ["file_editor_cm6", "app-worker"],
+  "ui": {{"subgroup_styles": {{"lsp": {{"bg": "blue"}}}}}},
+  "cwd": "/tmp/project",
+  "env_overrides": {{
+    "TE_APP_ID": "file_editor_cm6",
+    "TE_APP_WORKER_PORT": "42401"
+  }},
+  "pid": 12345,
+  "status": "running",
+  "created_at": 1778486289.4786,
+  "updated_at": 1778486289.5455,
+  "autostart": true,
+  "stdout_log": "{}",
+  "stderr_log": "{}",
+  "exit_code": null,
+  "run_id": "app-server",
+  "launcher_pid": 7671,
+  "adopted": true,
+  "backend": "proc",
+  "uses_pty": false,
+  "uses_pipes": false,
+  "uses_dtach": false,
+  "pty_mode": "raw",
+  "runtime_id": "runtime-id",
+  "signature": "signature",
+  "app_id": "file_editor_cm6",
+  "parent_shell_id": null,
+  "is_app_worker": true
+}}_worker": true
+}}"#,
+            stdout_log.display(),
+            stderr_log.display()
+        ),
+    )
+    .expect("write python record");
+
+    let record = load_persisted_record(&record_path).expect("load python fws record");
+    assert_eq!(record.id, "fs_python_record");
+    assert_eq!(record.label, "app-worker:file_editor_cm6");
+    assert_eq!(record.spec_id, "app:file_editor_cm6:app-worker");
+    assert_eq!(record.backend, "proc");
+    assert_eq!(record.pid, 12345);
+    assert_eq!(record.status, FerrousNativeShellStatus::Running);
+    assert_eq!(record.app_id.as_deref(), Some("file_editor_cm6"));
+    assert!(record.is_app_worker);
+    assert_eq!(
+        record
+            .env_overrides
+            .get("TE_APP_WORKER_PORT")
+            .map(String::as_str),
+        Some("42401")
+    );
+    assert!(record.adopted);
 }
 
 #[test]
