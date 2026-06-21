@@ -42,6 +42,10 @@ const FRAMEWORK_SHELLS_RUN_ID_KEY: &str = "FRAMEWORK_SHELLS_RUN_ID";
 const FRAMEWORK_SHELLS_FWS_SOCKETIO_URL_KEY: &str = "FRAMEWORK_SHELLS_FWS_SOCKETIO_URL";
 const TE_FRAMEWORK_URL_KEY: &str = "TE_FRAMEWORK_URL";
 const MAX_EXITED_SHELLS: usize = 50;
+const DIRECT_OUTPUT_READ_CHUNK_BYTES: usize = 64 * 1024;
+const DIRECT_OUTPUT_MAX_DRAIN_CHUNKS: usize = 64;
+const DIRECT_OUTPUT_LOG_FLUSH_BYTES: usize = 256 * 1024;
+const DIRECT_OUTPUT_LOG_FLUSH_INTERVAL_MS: u64 = 250;
 static NEXT_GLOBAL_SHELL_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -257,6 +261,7 @@ pub struct FerrousPipeConfig {
 pub struct FerrousNativeManager {
     state: Arc<Mutex<ManagerState>>,
     subscriptions: Arc<Mutex<OutputSubscriptions>>,
+    subscriber_count: Arc<AtomicU64>,
     lifecycle_tx: broadcast::Sender<FerrousNativeLifecycleEvent>,
     reactor: NativeRuntimeReactor,
     store: FerrousNativeStore,
@@ -381,7 +386,10 @@ struct DirectOutput {
     reader: Box<dyn ReadAsFd>,
     log: BufWriter<File>,
     line_buffer: Vec<u8>,
+    pending_flush_bytes: usize,
+    last_flush_at: Instant,
     subscriptions: Arc<Mutex<OutputSubscriptions>>,
+    subscriber_count: Arc<AtomicU64>,
 }
 
 trait ReadAsFd: Read + AsRawFd + Send {}
@@ -390,6 +398,7 @@ impl<T: Read + AsRawFd + Send> ReadAsFd for T {}
 #[derive(Clone)]
 struct NativeRuntimeReactor {
     tx: Sender<ReactorCommand>,
+    subscriber_count: Arc<AtomicU64>,
 }
 
 enum ReactorCommand {
@@ -402,6 +411,7 @@ struct ReactorLogStream {
     stream: FerrousNativeOutputStream,
     reader: Box<dyn ReadAsFd>,
     log: BufWriter<File>,
+    subscriber_count: Arc<AtomicU64>,
 }
 
 struct ReactorChild {
@@ -420,11 +430,15 @@ impl NativeRuntimeReactor {
     fn start(
         state: Arc<Mutex<ManagerState>>,
         subscriptions: Arc<Mutex<OutputSubscriptions>>,
+        subscriber_count: Arc<AtomicU64>,
         lifecycle_tx: broadcast::Sender<FerrousNativeLifecycleEvent>,
     ) -> Self {
         let (tx, rx) = channel::<ReactorCommand>();
         thread::spawn(move || reactor_loop(state, subscriptions, lifecycle_tx, rx));
-        Self { tx }
+        Self {
+            tx,
+            subscriber_count,
+        }
     }
 
     fn register_log_stream(
@@ -440,6 +454,7 @@ impl NativeRuntimeReactor {
                 stream,
                 reader: Box::new(reader),
                 log: BufWriter::with_capacity(256 * 1024, file),
+                subscriber_count: Arc::clone(&self.subscriber_count),
             }))
             .map_err(|_| anyhow!("native runtime reactor stopped"))
     }
@@ -497,15 +512,18 @@ impl FerrousNativeManager {
     pub fn with_store_and_env(store: FerrousNativeStore, native_env: FerrousNativeEnv) -> Self {
         let state = Arc::new(Mutex::new(ManagerState::default()));
         let subscriptions = Arc::new(Mutex::new(OutputSubscriptions::default()));
+        let subscriber_count = Arc::new(AtomicU64::new(0));
         let (lifecycle_tx, _) = broadcast::channel(1024);
         let reactor = NativeRuntimeReactor::start(
             Arc::clone(&state),
             Arc::clone(&subscriptions),
+            Arc::clone(&subscriber_count),
             lifecycle_tx.clone(),
         );
         Self {
             state,
             subscriptions,
+            subscriber_count,
             lifecycle_tx,
             reactor,
             store,
@@ -962,7 +980,10 @@ impl FerrousNativeManager {
             reader: Box::new(stdout),
             log: BufWriter::with_capacity(256 * 1024, stdout_file),
             line_buffer: Vec::new(),
+            pending_flush_bytes: 0,
+            last_flush_at: Instant::now(),
             subscriptions: Arc::clone(&self.subscriptions),
+            subscriber_count: Arc::clone(&self.subscriber_count),
         })));
         if let Some(stderr) = child.stderr.take() {
             set_nonblocking(&stderr)?;
@@ -1099,7 +1120,10 @@ impl FerrousNativeManager {
             reader: Box::new(master_output),
             log: BufWriter::with_capacity(256 * 1024, stdout_file),
             line_buffer: Vec::new(),
+            pending_flush_bytes: 0,
+            last_flush_at: Instant::now(),
             subscriptions: Arc::clone(&self.subscriptions),
+            subscriber_count: Arc::clone(&self.subscriber_count),
         })));
 
         let now = now_ms();
@@ -1386,6 +1410,7 @@ impl FerrousNativeManager {
             .entry((shell_id.to_owned(), stream))
             .or_default()
             .push(OutputSubscriber { tx });
+        self.subscriber_count.fetch_add(1, Ordering::Relaxed);
         Ok(Some(FerrousNativeOutputSubscription { rx }))
     }
 
@@ -1452,6 +1477,34 @@ impl FerrousNativeManager {
             .lock()
             .map_err(|_| anyhow!("native output lock poisoned"))?;
         output.read_chunk(timeout)
+    }
+
+    pub fn read_stdout_available_blocking(
+        &self,
+        shell_id: &str,
+        max_chunks: usize,
+        timeout: Duration,
+    ) -> Result<Vec<Vec<u8>>> {
+        let output = self.output_for(shell_id)?;
+        let Some(output) = output else {
+            return Ok(Vec::new());
+        };
+        let mut output = output
+            .lock()
+            .map_err(|_| anyhow!("native output lock poisoned"))?;
+        output.read_available(max_chunks, timeout)
+    }
+
+    pub fn flush_stdout_log_blocking(&self, shell_id: &str) -> Result<bool> {
+        let output = self.output_for(shell_id)?;
+        let Some(output) = output else {
+            return Ok(false);
+        };
+        let mut output = output
+            .lock()
+            .map_err(|_| anyhow!("native output lock poisoned"))?;
+        output.flush_log_if_due(true)?;
+        Ok(true)
     }
 
     pub fn read_line_blocking(&self, shell_id: &str, timeout: Duration) -> Result<Option<String>> {
@@ -2200,6 +2253,19 @@ impl DirectOutput {
     }
 
     fn read_chunk(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>> {
+        let chunks = self.read_available(DIRECT_OUTPUT_MAX_DRAIN_CHUNKS, timeout)?;
+        if chunks.is_empty() {
+            return Ok(None);
+        }
+        let total_len = chunks.iter().map(Vec::len).sum();
+        let mut out = Vec::with_capacity(total_len);
+        for chunk in chunks {
+            out.extend_from_slice(&chunk);
+        }
+        Ok(Some(out))
+    }
+
+    fn read_available(&mut self, max_chunks: usize, timeout: Duration) -> Result<Vec<Vec<u8>>> {
         let raw_fd = self.reader.as_raw_fd();
         // SAFETY: raw_fd is borrowed only for this poll call while self owns the fd.
         let borrowed = unsafe { BorrowedFd::borrow_raw(raw_fd) };
@@ -2210,16 +2276,22 @@ impl DirectOutput {
         let timeout = PollTimeout::try_from(timeout).unwrap_or(PollTimeout::MAX);
         let ready = poll(&mut fds, timeout).context("native output poll failed")?;
         if ready == 0 {
-            return Ok(None);
+            self.flush_log_if_due(false)?;
+            return Ok(Vec::new());
         }
-        let mut out = Vec::new();
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
+        let mut chunks = Vec::new();
+        let mut buffer = [0_u8; DIRECT_OUTPUT_READ_CHUNK_BYTES];
+        for _ in 0..max_chunks.max(1) {
             match self.reader.read(&mut buffer) {
-                Ok(0) => break,
+                Ok(0) => {
+                    self.flush_log_if_due(true)?;
+                    break;
+                }
                 Ok(n) => {
                     self.log.write_all(&buffer[..n])?;
-                    out.extend_from_slice(&buffer[..n]);
+                    self.pending_flush_bytes += n;
+                    chunks.push(buffer[..n].to_vec());
+                    self.flush_log_if_due(false)?;
                     if n < buffer.len() {
                         break;
                     }
@@ -2228,13 +2300,33 @@ impl DirectOutput {
                 Err(err) => return Err(err.into()),
             }
         }
-        self.log.flush()?;
-        if out.is_empty() {
-            Ok(None)
-        } else {
-            broadcast_output(&self.subscriptions, &self.shell_id, self.stream, &out);
-            Ok(Some(out))
+        self.flush_log_if_due(false)?;
+        if !chunks.is_empty() {
+            broadcast_output_batch(
+                &self.subscriptions,
+                &self.subscriber_count,
+                &self.shell_id,
+                self.stream,
+                &chunks,
+            );
         }
+        Ok(chunks)
+    }
+
+    fn flush_log_if_due(&mut self, force: bool) -> Result<()> {
+        if self.pending_flush_bytes == 0 {
+            return Ok(());
+        }
+        if force
+            || self.pending_flush_bytes >= DIRECT_OUTPUT_LOG_FLUSH_BYTES
+            || self.last_flush_at.elapsed()
+                >= Duration::from_millis(DIRECT_OUTPUT_LOG_FLUSH_INTERVAL_MS)
+        {
+            self.log.flush()?;
+            self.pending_flush_bytes = 0;
+            self.last_flush_at = Instant::now();
+        }
+        Ok(())
     }
 }
 
@@ -3116,7 +3208,13 @@ fn drain_reactor_stream(
                 if stream.log.write_all(&buffer[..n]).is_err() {
                     return false;
                 }
-                broadcast_output(subscriptions, &stream.shell_id, stream.stream, &buffer[..n]);
+                broadcast_output(
+                    subscriptions,
+                    &stream.subscriber_count,
+                    &stream.shell_id,
+                    stream.stream,
+                    &buffer[..n],
+                );
                 wrote = true;
                 if n < buffer.len() {
                     break;
@@ -3134,11 +3232,31 @@ fn drain_reactor_stream(
 
 fn broadcast_output(
     subscriptions: &Arc<Mutex<OutputSubscriptions>>,
+    subscriber_count: &Arc<AtomicU64>,
     shell_id: &str,
     stream: FerrousNativeOutputStream,
     bytes: &[u8],
 ) {
-    if bytes.is_empty() {
+    if bytes.is_empty() || subscriber_count.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    broadcast_output_batch(
+        subscriptions,
+        subscriber_count,
+        shell_id,
+        stream,
+        &[bytes.to_vec()],
+    );
+}
+
+fn broadcast_output_batch(
+    subscriptions: &Arc<Mutex<OutputSubscriptions>>,
+    subscriber_count: &Arc<AtomicU64>,
+    shell_id: &str,
+    stream: FerrousNativeOutputStream,
+    chunks: &[Vec<u8>],
+) {
+    if chunks.is_empty() || subscriber_count.load(Ordering::Relaxed) == 0 {
         return;
     }
     let Ok(mut subscriptions) = subscriptions.lock() else {
@@ -3150,25 +3268,48 @@ fn broadcast_output(
     };
     let mut dropped_count = subscriptions.dropped.get(&key).copied().unwrap_or(0);
     let mut retained = Vec::with_capacity(subscribers.len());
+    let mut removed_subscribers = 0_u64;
     for subscriber in subscribers.drain(..) {
-        let chunk = FerrousNativeOutputChunk {
-            shell_id: shell_id.to_owned(),
-            stream,
-            bytes: bytes.to_vec(),
-            dropped_before: dropped_count,
-        };
-        match subscriber.tx.try_send(chunk) {
-            Ok(()) => retained.push(subscriber),
-            Err(TrySendError::Full(_)) => {
-                dropped_count += 1;
+        let mut keep = true;
+        for bytes in chunks {
+            let chunk = FerrousNativeOutputChunk {
+                shell_id: shell_id.to_owned(),
+                stream,
+                bytes: bytes.clone(),
+                dropped_before: dropped_count,
+            };
+            match subscriber.tx.try_send(chunk) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    dropped_count += 1;
+                    keep = false;
+                    break;
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    keep = false;
+                    break;
+                }
             }
-            Err(TrySendError::Disconnected(_)) => {}
+        }
+        if keep {
+            retained.push(subscriber);
+        } else {
+            removed_subscribers += 1;
         }
     }
     if !retained.is_empty() {
         subscriptions.subscribers.insert(key.clone(), retained);
     }
     subscriptions.dropped.insert(key, dropped_count);
+    if removed_subscribers > 0 {
+        decrement_subscriber_count(subscriber_count, removed_subscribers);
+    }
+}
+
+fn decrement_subscriber_count(subscriber_count: &Arc<AtomicU64>, amount: u64) {
+    let _ = subscriber_count.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_sub(amount))
+    });
 }
 
 fn check_reactor_children(

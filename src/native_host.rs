@@ -1523,6 +1523,7 @@ async fn log_tail(
         let _ = state
             .manager
             .read_stdout_chunk_blocking(&shell_id, Duration::from_millis(query.drain_timeout_ms));
+        let _ = state.manager.flush_stdout_log_blocking(&shell_id);
     }
     let stdout = if query.stream == "stdout" || query.stream == "both" {
         Some(read_log_tail(&record.stdout_log, query.bytes).map_err(internal_error)?)

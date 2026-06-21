@@ -1440,6 +1440,36 @@ fn pipe_writes_stdin_and_reads_stdout_lines() {
 }
 
 #[test]
+fn pipe_read_stdout_available_returns_raw_chunks() {
+    let manager = FerrousNativeManager::new();
+    let log_dir = test_log_dir("pipe-read-available");
+    let record = manager
+        .spawn_pipe_blocking(base_pipe_config(
+            vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "printf 'raw-one\\nraw-two\\n'; sleep 1".to_owned(),
+            ],
+            log_dir,
+        ))
+        .expect("spawn pipe");
+
+    let chunks = manager
+        .read_stdout_available_blocking(&record.id, 8, Duration::from_secs(3))
+        .expect("read available");
+    let combined = chunks.concat();
+    let text = String::from_utf8_lossy(&combined);
+    assert!(text.contains("raw-one"));
+    assert!(text.contains("raw-two"));
+
+    assert!(
+        manager
+            .terminate_shell_blocking(&record.id)
+            .expect("terminate shell")
+    );
+}
+
+#[test]
 fn ferrous_framework_pipe_wrapper_exposes_blocking_line_contract() {
     let base_dir = test_log_dir("framework-pipe-base");
     let pipe = FerrousFrameworkPipe::spawn(FerrousPipeConfig {
