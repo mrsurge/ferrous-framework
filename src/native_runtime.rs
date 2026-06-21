@@ -19,9 +19,9 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     env,
     fs::{File, OpenOptions, create_dir_all, metadata, read_dir, read_to_string, rename},
-    io::{BufWriter, Read, Write},
+    io::{BufWriter, Error as IoError, ErrorKind, Read, Write},
     net::{TcpStream, ToSocketAddrs},
-    os::fd::{AsFd, AsRawFd, BorrowedFd},
+    os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -35,7 +35,10 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::broadcast;
+use tokio::{
+    io::unix::AsyncFd,
+    sync::{Mutex as AsyncMutex, broadcast},
+};
 
 const FRAMEWORK_SHELLS_SECRET_KEY: &str = "FRAMEWORK_SHELLS_SECRET";
 const FRAMEWORK_SHELLS_RUN_ID_KEY: &str = "FRAMEWORK_SHELLS_RUN_ID";
@@ -262,6 +265,7 @@ pub struct FerrousNativeManager {
     state: Arc<Mutex<ManagerState>>,
     subscriptions: Arc<Mutex<OutputSubscriptions>>,
     subscriber_count: Arc<AtomicU64>,
+    async_outputs: Arc<Mutex<HashMap<String, Arc<AsyncDirectOutput>>>>,
     lifecycle_tx: broadcast::Sender<FerrousNativeLifecycleEvent>,
     reactor: NativeRuntimeReactor,
     store: FerrousNativeStore,
@@ -392,6 +396,21 @@ struct DirectOutput {
     subscriber_count: Arc<AtomicU64>,
 }
 
+struct AsyncDirectOutput {
+    shell_id: String,
+    stream: FerrousNativeOutputStream,
+    reader: AsyncFd<OwnedFd>,
+    log: AsyncMutex<AsyncOutputLog>,
+    subscriptions: Arc<Mutex<OutputSubscriptions>>,
+    subscriber_count: Arc<AtomicU64>,
+}
+
+struct AsyncOutputLog {
+    log: BufWriter<File>,
+    pending_flush_bytes: usize,
+    last_flush_at: Instant,
+}
+
 trait ReadAsFd: Read + AsRawFd + Send {}
 impl<T: Read + AsRawFd + Send> ReadAsFd for T {}
 
@@ -513,6 +532,7 @@ impl FerrousNativeManager {
         let state = Arc::new(Mutex::new(ManagerState::default()));
         let subscriptions = Arc::new(Mutex::new(OutputSubscriptions::default()));
         let subscriber_count = Arc::new(AtomicU64::new(0));
+        let async_outputs = Arc::new(Mutex::new(HashMap::new()));
         let (lifecycle_tx, _) = broadcast::channel(1024);
         let reactor = NativeRuntimeReactor::start(
             Arc::clone(&state),
@@ -524,6 +544,7 @@ impl FerrousNativeManager {
             state,
             subscriptions,
             subscriber_count,
+            async_outputs,
             lifecycle_tx,
             reactor,
             store,
@@ -610,6 +631,15 @@ impl FerrousNativeManager {
         capacity: usize,
     ) -> Result<Option<FerrousNativeOutputSubscription>> {
         self.subscribe_output(shell_id, FerrousNativeOutputStream::Stdout, capacity)
+    }
+
+    pub async fn read_stdout_available(
+        &self,
+        shell_id: &str,
+        max_chunks: usize,
+    ) -> Result<Vec<Vec<u8>>> {
+        let output = self.async_stdout_output(shell_id)?;
+        output.read_available(max_chunks).await
     }
 
     pub fn subscribe_lifecycle(&self) -> broadcast::Receiver<FerrousNativeLifecycleEvent> {
@@ -1469,6 +1499,7 @@ impl FerrousNativeManager {
         shell_id: &str,
         timeout: Duration,
     ) -> Result<Option<Vec<u8>>> {
+        self.ensure_blocking_output_available(shell_id)?;
         let output = self.output_for(shell_id)?;
         let Some(output) = output else {
             return Ok(None);
@@ -1485,6 +1516,7 @@ impl FerrousNativeManager {
         max_chunks: usize,
         timeout: Duration,
     ) -> Result<Vec<Vec<u8>>> {
+        self.ensure_blocking_output_available(shell_id)?;
         let output = self.output_for(shell_id)?;
         let Some(output) = output else {
             return Ok(Vec::new());
@@ -1508,6 +1540,7 @@ impl FerrousNativeManager {
     }
 
     pub fn read_line_blocking(&self, shell_id: &str, timeout: Duration) -> Result<Option<String>> {
+        self.ensure_blocking_output_available(shell_id)?;
         let output = self.output_for(shell_id)?;
         let Some(output) = output else {
             return Ok(None);
@@ -1772,6 +1805,80 @@ impl FerrousNativeManager {
             return Ok(None);
         };
         Ok(entry.output.clone())
+    }
+
+    fn ensure_blocking_output_available(&self, shell_id: &str) -> Result<()> {
+        let async_outputs = self
+            .async_outputs
+            .lock()
+            .map_err(|_| anyhow!("native async output lock poisoned"))?;
+        if async_outputs.contains_key(shell_id) {
+            bail!("native shell {shell_id} stdout is owned by async reader");
+        }
+        Ok(())
+    }
+
+    fn async_stdout_output(&self, shell_id: &str) -> Result<Arc<AsyncDirectOutput>> {
+        {
+            let async_outputs = self
+                .async_outputs
+                .lock()
+                .map_err(|_| anyhow!("native async output lock poisoned"))?;
+            if let Some(output) = async_outputs.get(shell_id) {
+                return Ok(Arc::clone(output));
+            }
+        }
+
+        let (output, stdout_log) = {
+            let state = self.lock_state()?;
+            let Some(entry) = state.entries.get(shell_id) else {
+                bail!("native shell {shell_id} not found or not live");
+            };
+            if entry.record.status != FerrousNativeShellStatus::Running {
+                bail!("native shell {shell_id} is not running");
+            }
+            let Some(output) = entry.output.clone() else {
+                bail!("native shell {shell_id} does not expose stdout output");
+            };
+            (output, entry.record.stdout_log.clone())
+        };
+
+        let owned_fd = {
+            let mut output = output
+                .lock()
+                .map_err(|_| anyhow!("native output lock poisoned"))?;
+            output.flush_log_if_due(true)?;
+            duplicate_raw_fd(output.reader.as_raw_fd())?
+        };
+        set_nonblocking(&owned_fd)?;
+        let reader = AsyncFd::new(owned_fd).context("failed to attach native stdout AsyncFd")?;
+        let log_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&stdout_log)
+            .with_context(|| format!("failed to open stdout log {}", stdout_log.display()))?;
+        let output = Arc::new(AsyncDirectOutput {
+            shell_id: shell_id.to_owned(),
+            stream: FerrousNativeOutputStream::Stdout,
+            reader,
+            log: AsyncMutex::new(AsyncOutputLog {
+                log: BufWriter::with_capacity(256 * 1024, log_file),
+                pending_flush_bytes: 0,
+                last_flush_at: Instant::now(),
+            }),
+            subscriptions: Arc::clone(&self.subscriptions),
+            subscriber_count: Arc::clone(&self.subscriber_count),
+        });
+
+        let mut async_outputs = self
+            .async_outputs
+            .lock()
+            .map_err(|_| anyhow!("native async output lock poisoned"))?;
+        Ok(Arc::clone(
+            async_outputs
+                .entry(shell_id.to_owned())
+                .or_insert_with(|| output),
+        ))
     }
 
     fn live_shell_backend(&self, shell_id: &str) -> Result<String> {
@@ -2330,6 +2437,65 @@ impl DirectOutput {
     }
 }
 
+impl AsyncDirectOutput {
+    async fn read_available(&self, max_chunks: usize) -> Result<Vec<Vec<u8>>> {
+        loop {
+            let mut guard = self
+                .reader
+                .readable()
+                .await
+                .context("native async stdout readiness failed")?;
+            match guard.try_io(|inner| read_fd_available(inner.get_ref().as_raw_fd(), max_chunks)) {
+                Ok(Ok(chunks)) => {
+                    self.write_chunks_to_log(&chunks).await?;
+                    if !chunks.is_empty() {
+                        broadcast_output_batch(
+                            &self.subscriptions,
+                            &self.subscriber_count,
+                            &self.shell_id,
+                            self.stream,
+                            &chunks,
+                        );
+                    }
+                    return Ok(chunks);
+                }
+                Ok(Err(error)) => return Err(error.into()),
+                Err(_would_block) => continue,
+            }
+        }
+    }
+
+    async fn write_chunks_to_log(&self, chunks: &[Vec<u8>]) -> Result<()> {
+        if chunks.is_empty() {
+            return Ok(());
+        }
+        let mut log = self.log.lock().await;
+        for chunk in chunks {
+            log.log.write_all(chunk)?;
+            log.pending_flush_bytes += chunk.len();
+        }
+        log.flush_if_due(false)
+    }
+}
+
+impl AsyncOutputLog {
+    fn flush_if_due(&mut self, force: bool) -> Result<()> {
+        if self.pending_flush_bytes == 0 {
+            return Ok(());
+        }
+        if force
+            || self.pending_flush_bytes >= DIRECT_OUTPUT_LOG_FLUSH_BYTES
+            || self.last_flush_at.elapsed()
+                >= Duration::from_millis(DIRECT_OUTPUT_LOG_FLUSH_INTERVAL_MS)
+        {
+            self.log.flush()?;
+            self.pending_flush_bytes = 0;
+            self.last_flush_at = Instant::now();
+        }
+        Ok(())
+    }
+}
+
 fn boxed_writer(writer: impl Write + Send + 'static) -> Arc<Mutex<Box<dyn Write + Send>>> {
     Arc::new(Mutex::new(Box::new(writer) as Box<dyn Write + Send>))
 }
@@ -2810,6 +2976,53 @@ fn set_nonblocking(fd: &impl AsFd) -> Result<()> {
     let flags = OFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFL)?);
     fcntl(fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
     Ok(())
+}
+
+fn duplicate_raw_fd(raw_fd: i32) -> Result<OwnedFd> {
+    let duplicated = unsafe { libc::dup(raw_fd) };
+    if duplicated < 0 {
+        return Err(IoError::last_os_error()).context("failed to duplicate native stdout fd");
+    }
+    // SAFETY: `dup` returns a fresh owned file descriptor on success.
+    Ok(unsafe { OwnedFd::from_raw_fd(duplicated) })
+}
+
+fn read_fd_available(raw_fd: i32, max_chunks: usize) -> std::io::Result<Vec<Vec<u8>>> {
+    let mut chunks = Vec::new();
+    let mut buffer = [0_u8; DIRECT_OUTPUT_READ_CHUNK_BYTES];
+    for _ in 0..max_chunks.max(1) {
+        let read_count = unsafe {
+            libc::read(
+                raw_fd,
+                buffer.as_mut_ptr().cast::<libc::c_void>(),
+                buffer.len(),
+            )
+        };
+        if read_count == 0 {
+            return Ok(chunks);
+        }
+        if read_count > 0 {
+            let read_count = usize::try_from(read_count).unwrap_or_default();
+            chunks.push(buffer[..read_count].to_vec());
+            if read_count < buffer.len() {
+                return Ok(chunks);
+            }
+            continue;
+        }
+
+        let error = IoError::last_os_error();
+        if error.kind() == ErrorKind::Interrupted {
+            continue;
+        }
+        if error.kind() == ErrorKind::WouldBlock {
+            if chunks.is_empty() {
+                return Err(error);
+            }
+            return Ok(chunks);
+        }
+        return Err(error);
+    }
+    Ok(chunks)
 }
 
 fn parse_pty_mode(raw: &str) -> Result<FerrousNativePtyMode> {

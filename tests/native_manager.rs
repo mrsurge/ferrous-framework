@@ -1470,6 +1470,48 @@ fn pipe_read_stdout_available_returns_raw_chunks() {
 }
 
 #[test]
+fn pipe_async_stdout_available_returns_raw_chunks_and_owns_reader() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    runtime.block_on(async {
+        let manager = FerrousNativeManager::new();
+        let log_dir = test_log_dir("pipe-async-read-available");
+        let record = manager
+            .spawn_pipe_blocking(base_pipe_config(
+                vec![
+                    "sh".to_owned(),
+                    "-c".to_owned(),
+                    "printf 'async-one\\nasync-two\\n'; sleep 1".to_owned(),
+                ],
+                log_dir,
+            ))
+            .expect("spawn pipe");
+
+        let chunks = manager
+            .read_stdout_available(&record.id, 8)
+            .await
+            .expect("async read available");
+        let combined = chunks.concat();
+        let text = String::from_utf8_lossy(&combined);
+        assert!(text.contains("async-one"));
+        assert!(text.contains("async-two"));
+
+        let error = manager
+            .read_stdout_chunk_blocking(&record.id, Duration::from_millis(10))
+            .expect_err("blocking read should not race async owner");
+        assert!(error.to_string().contains("owned by async reader"));
+
+        assert!(
+            manager
+                .terminate_shell_blocking(&record.id)
+                .expect("terminate shell")
+        );
+    });
+}
+
+#[test]
 fn ferrous_framework_pipe_wrapper_exposes_blocking_line_contract() {
     let base_dir = test_log_dir("framework-pipe-base");
     let pipe = FerrousFrameworkPipe::spawn(FerrousPipeConfig {
@@ -2352,26 +2394,39 @@ async fn run_async_facade_pipe_concurrent_rtt(
     let reader_manager = manager.clone();
     let reader_shell_id = shell_id.clone();
     let reader_waiters = std::sync::Arc::clone(&waiters);
-    let reader = tokio::task::spawn_blocking(move || {
+    let reader = tokio::spawn(async move {
         let mut received = 0_usize;
+        let mut buffer = Vec::new();
         while received < request_count {
-            let line = reader_manager
-                .read_line_blocking(&reader_shell_id, Duration::from_secs(5))
-                .expect("concurrent read line")
-                .expect("concurrent response line");
-            let response: Value = serde_json::from_str(&line).expect("concurrent response json");
-            let id = response
-                .get("id")
-                .and_then(Value::as_u64)
-                .and_then(|value| usize::try_from(value).ok())
-                .expect("concurrent response id");
-            let waiter = reader_waiters
-                .lock()
-                .expect("waiter map lock")
-                .remove(&id)
-                .expect("response waiter");
-            waiter.send(line).expect("send response to waiter");
-            received += 1;
+            let chunks = tokio::time::timeout(
+                Duration::from_secs(5),
+                reader_manager.read_stdout_available(&reader_shell_id, 64),
+            )
+            .await
+            .expect("concurrent async read timeout")
+            .expect("concurrent async read available");
+            for chunk in chunks {
+                buffer.extend_from_slice(&chunk);
+                while let Some(line) = take_bench_line(&mut buffer) {
+                    let response: Value =
+                        serde_json::from_str(&line).expect("concurrent response json");
+                    let id = response
+                        .get("id")
+                        .and_then(Value::as_u64)
+                        .and_then(|value| usize::try_from(value).ok())
+                        .expect("concurrent response id");
+                    let waiter = reader_waiters
+                        .lock()
+                        .expect("waiter map lock")
+                        .remove(&id)
+                        .expect("response waiter");
+                    waiter.send(line).expect("send response to waiter");
+                    received += 1;
+                    if received >= request_count {
+                        break;
+                    }
+                }
+            }
         }
         received
     });
@@ -2473,6 +2528,18 @@ fn assert_pipe_rtt_response(line: &str, id: usize, payload_size: usize) {
             .map(str::len),
         Some(payload_size)
     );
+}
+
+fn take_bench_line(buffer: &mut Vec<u8>) -> Option<String> {
+    let newline = buffer.iter().position(|byte| *byte == b'\n')?;
+    let mut raw = buffer.drain(..=newline).collect::<Vec<_>>();
+    if raw.last() == Some(&b'\n') {
+        raw.pop();
+    }
+    if raw.last() == Some(&b'\r') {
+        raw.pop();
+    }
+    Some(String::from_utf8_lossy(&raw).into_owned())
 }
 
 fn duration_stats(samples: &[Duration]) -> DurationStats {
