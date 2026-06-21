@@ -1234,13 +1234,17 @@ impl FerrousNativeManager {
     pub fn terminate_shell_blocking(&self, shell_id: &str) -> Result<bool> {
         let child = {
             let state = self.lock_state()?;
-            let Some(entry) = state.entries.get(shell_id) else {
-                return Ok(false);
-            };
-            if entry.record.status == FerrousNativeShellStatus::Exited {
-                return Ok(true);
+            if let Some(entry) = state.entries.get(shell_id) {
+                if entry.record.status == FerrousNativeShellStatus::Exited {
+                    return Ok(true);
+                }
+                Some(Arc::clone(&entry.child))
+            } else {
+                None
             }
-            Arc::clone(&entry.child)
+        };
+        let Some(child) = child else {
+            return self.terminate_persisted_shell_blocking(shell_id, libc::SIGKILL);
         };
         let mut child = child
             .lock()
@@ -1248,6 +1252,35 @@ impl FerrousNativeManager {
         if child.try_wait()?.is_none() {
             child.kill()?;
         }
+        Ok(true)
+    }
+
+    fn terminate_persisted_shell_blocking(
+        &self,
+        shell_id: &str,
+        signal: libc::c_int,
+    ) -> Result<bool> {
+        let Some(record) = self.get_shell(shell_id)? else {
+            return Ok(false);
+        };
+        if record.status == FerrousNativeShellStatus::Exited {
+            return Ok(true);
+        }
+        let pid = i64::from(record.pid);
+        if !pid_is_live_i64(pid) {
+            self.mark_record_exited(&record, None)?;
+            return Ok(true);
+        }
+        if signal_pid_or_process_group(pid, signal)? {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while pid_is_live_i64(pid) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+        if pid_is_live_i64(pid) {
+            bail!("native shell {shell_id} pid {pid} did not exit after signal {signal}");
+        }
+        self.mark_record_exited(&record, Some(-signal))?;
         Ok(true)
     }
 
@@ -2482,6 +2515,29 @@ fn signal_pid(pid: i64, signal: libc::c_int) -> Result<bool> {
         return Ok(false);
     }
     Err(error).with_context(|| format!("failed to signal pid {pid}"))
+}
+
+fn signal_pid_or_process_group(pid: i64, signal: libc::c_int) -> Result<bool> {
+    if pid <= 0 || pid > i64::from(i32::MAX) {
+        bail!("invalid pid {pid}");
+    }
+    let pid_t = pid as libc::pid_t;
+    let pgid = unsafe { libc::getpgid(pid_t) };
+    if pgid > 0 {
+        let current_pgrp = unsafe { libc::getpgrp() };
+        if pgid != current_pgrp {
+            let result = unsafe { libc::killpg(pgid, signal) };
+            if result == 0 {
+                return Ok(true);
+            }
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error)
+                    .with_context(|| format!("failed to signal process group {pgid}"));
+            }
+        }
+    }
+    signal_pid(pid, signal)
 }
 
 fn limit_exited_shell_history(

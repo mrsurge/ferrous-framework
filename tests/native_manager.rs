@@ -10,6 +10,7 @@ use std::{
     collections::HashMap,
     fs,
     path::PathBuf,
+    process::Command,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -1126,8 +1127,8 @@ fn fresh_manager_lists_persisted_records_as_adopted_stale_records() {
     assert_eq!(
         fresh
             .terminate_shell_blocking(&record.id)
-            .expect("stale terminate should report unavailable"),
-        false
+            .expect("stale terminate should be idempotent"),
+        true
     );
 
     let listed = fresh.list_shells().expect("list persisted shells");
@@ -1158,6 +1159,51 @@ fn terminates_running_proc() {
         .expect("shell record");
     assert_eq!(exited.status, FerrousNativeShellStatus::Exited);
     assert_ne!(exited.exit_code, Some(0));
+}
+
+#[test]
+fn terminates_adopted_persisted_record_by_pid() {
+    let manager = test_manager_with_store("terminate-adopted-pid");
+    let mut child = Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn unmanaged child");
+    let shell_id = "fs_python_owned_stop_target";
+    let record_dir = manager.store().metadata_dir.join(shell_id);
+    fs::create_dir_all(&record_dir).expect("record dir");
+    let record_path = record_dir.join("meta.json");
+    fs::write(
+        &record_path,
+        json!({
+            "id": shell_id,
+            "backend": "proc",
+            "pid": child.id(),
+            "status": "running",
+            "label": "python-owned-stop-target",
+            "subgroups": ["tests"],
+            "record_path": record_path.to_string_lossy(),
+            "stdout_log": manager.store().logs_dir.join(format!("{shell_id}.stdout.log")).to_string_lossy(),
+            "stderr_log": manager.store().logs_dir.join(format!("{shell_id}.stderr.log")).to_string_lossy(),
+            "created_at": 1.0,
+            "updated_at": 1.0
+        })
+        .to_string(),
+    )
+    .expect("write adopted record");
+
+    assert!(
+        manager
+            .terminate_shell_blocking(shell_id)
+            .expect("terminate adopted pid")
+    );
+    let _ = child.try_wait();
+    assert!(
+        !test_pid_is_live(i64::from(child.id())),
+        "unmanaged child should be stopped"
+    );
+    let adopted = load_persisted_record(&record_path).expect("load adopted");
+    assert_eq!(adopted.status, FerrousNativeShellStatus::Exited);
+    assert_eq!(adopted.exit_code, Some(-9));
 }
 
 #[test]
