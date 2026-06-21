@@ -1,6 +1,7 @@
 use ferrous_framework::{
     FerrousNativeEnv, FerrousNativeHost, FerrousNativeHostConfig, FerrousNativeManager,
-    FerrousNativeStore, derive_native_api_token,
+    FerrousNativePeer, FerrousNativePeerConfig, FerrousNativePipeConfig, FerrousNativeStore,
+    derive_native_api_token,
 };
 use serde_json::{Value, json};
 use std::{
@@ -28,7 +29,10 @@ fn test_log_dir(name: &str) -> PathBuf {
 }
 
 fn test_manager(name: &str) -> FerrousNativeManager {
-    let secret = format!("host-secret-{name}");
+    test_manager_with_secret(name, format!("host-secret-{name}"))
+}
+
+fn test_manager_with_secret(name: &str, secret: String) -> FerrousNativeManager {
     let store = FerrousNativeStore::from_base_dir_fingerprint_secret(
         test_log_dir(name).join("fws-base"),
         "host_test_fingerprint".to_owned(),
@@ -59,8 +63,20 @@ fn native_host_serves_control_plane_and_shell_io() {
     assert_eq!(status, 200);
     assert_eq!(json_body(&body)["data"]["backend"], "ferrous-native");
 
+    let (status, body) = request(addr, "GET", "/api/framework_shells/runtime", &[], "");
+    assert_eq!(status, 200);
+    let runtime = json_body(&body);
+    assert_eq!(runtime["data"]["socketio"], true);
+    assert_eq!(runtime["data"]["socketio_namespace"], "/fws");
+    assert_eq!(runtime["data"]["socketio_path"], "/fws_ws/socket.io");
+    assert_eq!(runtime["data"]["peer_count"], 0);
+
     let env = host.child_env_overlay();
     assert_eq!(env.get("TE_FRAMEWORK_URL"), Some(&host.url()));
+    assert_eq!(
+        env.get("FRAMEWORK_SHELLS_FWS_SOCKETIO_URL"),
+        Some(&host.url())
+    );
     assert!(env.contains_key("FRAMEWORK_SHELLS_SECRET"));
 
     let create = json!({
@@ -128,6 +144,83 @@ fn native_host_serves_control_plane_and_shell_io() {
     assert_eq!(shutdown["data"]["stats"]["force_killed"], 1);
 
     host.close_blocking().expect("close host");
+}
+
+#[test]
+fn native_host_routes_shell_input_to_ferrous_peer() {
+    let secret = "ferrous-peer-shared-secret".to_owned();
+    let host_manager = test_manager_with_secret("peer-controller", secret.clone());
+    let peer_manager = test_manager_with_secret("peer-owner", secret.clone());
+    let token = derive_native_api_token(&secret);
+    let host =
+        FerrousNativeHost::spawn_with_manager(FerrousNativeHostConfig::default(), host_manager)
+            .expect("spawn native host");
+    let addr = host.addr();
+
+    let peer = FerrousNativePeer::connect(
+        peer_manager.clone(),
+        FerrousNativePeerConfig::new(host.url()),
+    )
+    .expect("connect ferrous peer");
+    wait_for_peer_count(addr, 1);
+
+    let shell = peer_manager
+        .spawn_pipe_blocking(FerrousNativePipeConfig {
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "while IFS= read -r line; do printf 'peer-ack:%s\\n' \"$line\"; done".into(),
+            ],
+            cwd: None,
+            env: HashMap::new(),
+            label: "peer-pipe".into(),
+            spec_id: "peer-pipe".into(),
+            subgroups: vec!["peer-tests".into()],
+            log_dir: None,
+        })
+        .expect("spawn peer pipe");
+
+    let input = json!({ "data": "from-controller", "append_newline": true }).to_string();
+    let (status, body) = request(
+        addr,
+        "POST",
+        &format!("/api/framework_shells/{}/input", shell.id),
+        &[("X-Framework-Key", token.as_str())],
+        &input,
+    );
+    assert_eq!(status, 200, "body: {body}");
+    let response = json_body(&body);
+    assert_eq!(response["data"]["accepted"], true);
+    assert_eq!(response["data"]["shell_id"], shell.id);
+
+    let line = peer_manager
+        .read_line_blocking(&shell.id, Duration::from_secs(3))
+        .expect("read peer shell line")
+        .expect("peer shell response");
+    assert!(
+        line.contains("peer-ack:from-controller"),
+        "unexpected peer shell line: {line:?}"
+    );
+
+    peer.disconnect().expect("disconnect peer");
+    let _ = peer_manager.terminate_shell_strict_blocking(&shell.id, true);
+    host.close_blocking().expect("close host");
+}
+
+fn wait_for_peer_count(addr: SocketAddr, expected: usize) {
+    for _ in 0..50 {
+        let (status, body) = request(addr, "GET", "/api/framework_shells/runtime", &[], "");
+        if status == 200
+            && json_body(&body)["data"]["peer_count"]
+                .as_u64()
+                .map(|count| count as usize)
+                == Some(expected)
+        {
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!("timed out waiting for peer_count={expected}");
 }
 
 fn request(

@@ -29,6 +29,8 @@ Current native API:
 - `FerrousNativeShellCapabilities`
 - `FerrousNativeHost`
 - `FerrousNativeHostConfig`
+- `FerrousNativePeer`
+- `FerrousNativePeerConfig`
 - `FerrousFrameworkPipe`
 - `FerrousPipeConfig`
 - `FerrousNativePipeState`
@@ -107,7 +109,17 @@ Current host surfaces:
 
 Mutating routes require the same API token shape as Python FWS: `HMAC(secret, "api")`, passed as `X-Framework-Key` or `Authorization: Bearer ...`. `derive_native_api_token(...)` exposes that token derivation for Rust callers and tests.
 
-The MVP host reports `socketio: false`; it is an HTTP/dashboard/control-plane root, not a Socket.IO-compatible peer lane yet. Group shutdown currently terminates Ferrous-owned live shell roots for the derived app/group id and returns the shutdown DTO shape.
+The host also owns a Socket.IO controller lane for FWS peer interoperability:
+
+- Socket.IO path: `/fws_ws/socket.io`
+- Namespace: `/fws`
+- Transport: websocket-only for the current MVP
+- Peer event lane: `fws_peer_subscriptions`, `fws_peer_request`, and `fws_peer_notification`
+- Browser/dashboard lane: `fws_request` and `fws_notification`
+
+Peer auth uses the same shared-secret API token and runtime-id contract as Python FWS. Connected peers join the `fws:peers` room, receive active log-subscription hints, can return typed ack responses for `fws.shell.input`, and can push dashboard/log notifications back to the controller. The controller handles shell input local-first, then fans out to connected peers when local live input is unavailable. Group shutdown currently terminates Ferrous-owned live shell roots for the derived app/group id and returns the shutdown DTO shape.
+
+`FerrousNativePeer` is the matching Rust peer-client MVP. It connects to a Python or Ferrous controller using the same base URL plus `/fws_ws/socket.io`, authenticates as `role: "peer"`, tracks `fws_peer_subscriptions`, handles `fws_peer_request` for `fws.shell.input` by calling the local native manager write/EOF primitives, and returns the required Socket.IO ack DTO. It also exposes `emit_notification(...)` for explicit peer notifications. Automatic native event/log relay over this peer client is intentionally not claimed yet.
 
 ## FWS Environment Contract
 
@@ -120,7 +132,7 @@ The MVP host reports `socketio: false`; it is an HTTP/dashboard/control-plane ro
 
 If `FRAMEWORK_SHELLS_SECRET` is absent, Ferrous follows the FWS CLI bootstrap shape: it loads `runtimes/<repo_fingerprint>/secret` when present, otherwise generates a `temporary_secret_<hex>` value and stores it there with owner-only permissions where supported. If `FRAMEWORK_SHELLS_RUN_ID` is absent, Ferrous generates a native run id. URL values are optional until a host/dashboard runtime is attached.
 
-When `FerrousNativeHost::spawn(...)` creates the manager, it sets `TE_FRAMEWORK_URL` to the bound host URL when the value is otherwise absent. The MVP host intentionally does not set `FRAMEWORK_SHELLS_FWS_SOCKETIO_URL` until a real Socket.IO-compatible lane exists.
+When `FerrousNativeHost::spawn(...)` creates the manager, it sets `TE_FRAMEWORK_URL` and `FRAMEWORK_SHELLS_FWS_SOCKETIO_URL` to the bound host URL when those values are otherwise absent. Child Ferrous/Python FWS peers use that URL with the fixed Socket.IO path `/fws_ws/socket.io` and namespace `/fws`.
 
 For explicit host control, construct the manager with `FerrousNativeManager::with_env(FerrousNativeEnv { ... })`. Every native `proc`, `pipe`, and `pty` spawn receives that overlay, then the shell config `env` is applied last so shell-specific overrides still work.
 

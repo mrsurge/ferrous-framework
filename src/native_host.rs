@@ -2,6 +2,14 @@ use crate::native_runtime::{
     FerrousNativeManager, FerrousNativePipeConfig, FerrousNativeProcConfig, FerrousNativePtyConfig,
     FerrousNativePtyMode, FerrousNativeShellRecord, FerrousNativeShellStatus, FerrousNativeStore,
 };
+use crate::peer_protocol::{
+    FWS_BROWSER_ROLE, FWS_DASHBOARD_OPEN_METHOD, FWS_DASHBOARD_REFRESH_METHOD, FWS_DASHBOARD_ROOM,
+    FWS_ERROR_METHOD, FWS_LOGS_CLOSE_METHOD, FWS_LOGS_INITIAL_METHOD, FWS_LOGS_OPEN_METHOD,
+    FWS_NOTIFICATION_EVENT, FWS_PEER_NOTIFICATION_EVENT, FWS_PEER_REQUEST_EVENT, FWS_PEER_ROLE,
+    FWS_PEER_ROOM, FWS_PEER_SUBSCRIPTIONS_EVENT, FWS_SHELL_INPUT_METHOD, FWS_SOCKETIO_NAMESPACE,
+    FWS_SOCKETIO_SOCKET_PATH, FwsJsonRpcNotification, FwsPeerShellInputRequest,
+    FwsPeerSubscriptions, shell_room,
+};
 use crate::shellspec::ShellspecRenderInput;
 use anyhow::{Context, Result, anyhow};
 use axum::{
@@ -11,16 +19,25 @@ use axum::{
     response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
+use futures_util::StreamExt;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value, json};
 use sha2::Sha256;
+use socketioxide::{
+    SocketIo, TransportType,
+    extract::{AckSender, Data, SocketRef, TryData},
+};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::File,
     io::{Read, Seek, SeekFrom},
     net::{SocketAddr, TcpListener, ToSocketAddrs},
     path::{Path as FsPath, PathBuf},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     thread::{self, JoinHandle},
     time::Duration,
 };
@@ -58,6 +75,15 @@ struct HostState {
     api_token: String,
     require_auth: bool,
     base_url: String,
+    socketio: Option<SocketIo>,
+    socketio_runtime: SocketIoRuntimeState,
+}
+
+#[derive(Clone, Default)]
+struct SocketIoRuntimeState {
+    peer_sids: Arc<Mutex<HashSet<String>>>,
+    browser_log_subscriptions: Arc<Mutex<HashMap<String, String>>>,
+    peer_notifications_received: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -79,6 +105,10 @@ struct HostInfoPayload {
     transport_owner: &'static str,
     python_runtime: bool,
     socketio: bool,
+    socketio_namespace: &'static str,
+    socketio_path: &'static str,
+    peer_count: usize,
+    peer_notifications_received: u64,
     url: String,
     store: StorePayload,
 }
@@ -250,6 +280,8 @@ impl FerrousNativeHost {
         let mut env = self.manager.child_env_overlay();
         env.entry("TE_FRAMEWORK_URL".to_owned())
             .or_insert_with(|| self.url());
+        env.entry("FRAMEWORK_SHELLS_FWS_SOCKETIO_URL".to_owned())
+            .or_insert_with(|| self.url());
         env
     }
 
@@ -282,6 +314,8 @@ impl FerrousNativeHost {
             manager: manager.clone(),
             require_auth: config.require_auth,
             base_url: url_for_addr(addr),
+            socketio: None,
+            socketio_runtime: SocketIoRuntimeState::default(),
         };
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let join = thread::spawn(move || run_host_thread(listener, state, shutdown_rx));
@@ -309,7 +343,7 @@ pub fn derive_api_token(secret: &str) -> String {
 
 fn run_host_thread(
     listener: TcpListener,
-    state: HostState,
+    mut state: HostState,
     shutdown_rx: oneshot::Receiver<()>,
 ) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -317,9 +351,18 @@ fn run_host_thread(
         .build()
         .context("failed to build native host tokio runtime")?;
     runtime.block_on(async move {
+        let (socketio_layer, io) = SocketIo::builder()
+            .req_path(FWS_SOCKETIO_SOCKET_PATH)
+            .transports([TransportType::Websocket])
+            .max_payload(8 * 1024 * 1024)
+            .ack_timeout(Duration::from_secs(3))
+            .build_layer();
+        state.socketio = Some(io.clone());
+        register_fws_socketio_namespace(&io, state.clone());
+
         let listener = tokio::net::TcpListener::from_std(listener)
             .context("failed to attach native host listener to tokio")?;
-        axum::serve(listener, router(state))
+        axum::serve(listener, router(state).layer(socketio_layer))
             .with_graceful_shutdown(async {
                 let _ = shutdown_rx.await;
             })
@@ -357,6 +400,561 @@ fn router(state: HostState) -> Router {
         .with_state(state)
 }
 
+impl SocketIoRuntimeState {
+    fn add_peer(&self, sid: String) {
+        if let Ok(mut peers) = self.peer_sids.lock() {
+            peers.insert(sid);
+        }
+    }
+
+    fn remove_peer(&self, sid: &str) {
+        if let Ok(mut peers) = self.peer_sids.lock() {
+            peers.remove(sid);
+        }
+    }
+
+    fn is_peer(&self, sid: &str) -> bool {
+        self.peer_sids
+            .lock()
+            .map(|peers| peers.contains(sid))
+            .unwrap_or(false)
+    }
+
+    fn peer_count(&self) -> usize {
+        self.peer_sids.lock().map(|peers| peers.len()).unwrap_or(0)
+    }
+
+    fn set_browser_log_shell(&self, sid: String, shell_id: Option<String>) -> Option<String> {
+        let Ok(mut subscriptions) = self.browser_log_subscriptions.lock() else {
+            return None;
+        };
+        let previous = subscriptions.remove(&sid);
+        if let Some(shell_id) = shell_id {
+            subscriptions.insert(sid, shell_id);
+        }
+        previous
+    }
+
+    fn remove_browser(&self, sid: &str) -> Option<String> {
+        self.browser_log_subscriptions
+            .lock()
+            .ok()
+            .and_then(|mut subscriptions| subscriptions.remove(sid))
+    }
+
+    fn active_log_shell_ids(&self) -> Vec<String> {
+        let Ok(subscriptions) = self.browser_log_subscriptions.lock() else {
+            return Vec::new();
+        };
+        let mut shell_ids = subscriptions
+            .values()
+            .filter(|shell_id| !shell_id.is_empty())
+            .cloned()
+            .collect::<Vec<_>>();
+        shell_ids.sort();
+        shell_ids.dedup();
+        shell_ids
+    }
+}
+
+fn register_fws_socketio_namespace(io: &SocketIo, state: HostState) {
+    let connect_state = state.clone();
+    io.ns(
+        FWS_SOCKETIO_NAMESPACE,
+        move |socket: SocketRef, TryData(auth): TryData<Value>| {
+            let state = connect_state.clone();
+            async move {
+                handle_fws_socketio_connect(socket, auth.ok(), state).await;
+            }
+        },
+    );
+}
+
+async fn handle_fws_socketio_connect(socket: SocketRef, auth: Option<Value>, state: HostState) {
+    let sid = socket.id.to_string();
+    let role = auth
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|mapping| mapping.get("role"))
+        .and_then(Value::as_str)
+        .unwrap_or(FWS_BROWSER_ROLE);
+
+    if role == FWS_PEER_ROLE {
+        if !peer_auth_valid(&state, auth.as_ref()) {
+            let _ = socket.disconnect();
+            return;
+        }
+        state.socketio_runtime.add_peer(sid.clone());
+        socket.join(FWS_PEER_ROOM);
+        let _ = socket.emit(
+            FWS_PEER_SUBSCRIPTIONS_EVENT,
+            &FwsPeerSubscriptions {
+                shell_ids: state.socketio_runtime.active_log_shell_ids(),
+            },
+        );
+    }
+
+    let disconnect_state = state.clone();
+    socket.on_disconnect(move |socket: SocketRef| {
+        let state = disconnect_state.clone();
+        async move {
+            let sid = socket.id.to_string();
+            state.socketio_runtime.remove_peer(&sid);
+            let previous_shell_id = state.socketio_runtime.remove_browser(&sid);
+            if let Some(shell_id) = previous_shell_id {
+                broadcast_peer_subscriptions(&state).await;
+                socket.leave(shell_room(&shell_id));
+            }
+        }
+    });
+
+    let notification_state = state.clone();
+    socket.on(
+        FWS_PEER_NOTIFICATION_EVENT,
+        move |socket: SocketRef, Data::<Value>(notification)| {
+            let state = notification_state.clone();
+            async move {
+                handle_peer_notification(socket, notification, state).await;
+            }
+        },
+    );
+
+    let request_state = state;
+    socket.on(
+        crate::peer_protocol::FWS_REQUEST_EVENT,
+        move |socket: SocketRef, Data::<Value>(request), ack: AckSender| {
+            let state = request_state.clone();
+            async move {
+                let response = handle_browser_request(socket, request, state).await;
+                let _ = ack.send(&response);
+            }
+        },
+    );
+}
+
+fn peer_auth_valid(state: &HostState, auth: Option<&Value>) -> bool {
+    let Some(mapping) = auth.and_then(Value::as_object) else {
+        return false;
+    };
+    let api_token = mapping.get("api_token").and_then(Value::as_str);
+    let runtime_id = mapping.get("runtime_id").and_then(Value::as_str);
+    api_token == Some(state.api_token.as_str())
+        && runtime_id == Some(state.manager.store().runtime_id.as_str())
+}
+
+async fn handle_peer_notification(socket: SocketRef, notification: Value, state: HostState) {
+    let sid = socket.id.to_string();
+    if !state.socketio_runtime.is_peer(&sid) {
+        return;
+    }
+    let Some(method) = notification.get("method").and_then(Value::as_str) else {
+        return;
+    };
+    if notification.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return;
+    }
+    state
+        .socketio_runtime
+        .peer_notifications_received
+        .fetch_add(1, Ordering::Relaxed);
+
+    if matches!(
+        method,
+        "fws.shell.created"
+            | "fws.shell.spawned"
+            | "fws.shell.updated"
+            | "fws.shell.exited"
+            | "fws.shell.removed"
+    ) {
+        let _ = socket
+            .to(FWS_DASHBOARD_ROOM)
+            .emit(FWS_NOTIFICATION_EVENT, &notification)
+            .await;
+        return;
+    }
+
+    if matches!(
+        method,
+        FWS_LOGS_INITIAL_METHOD
+            | crate::peer_protocol::FWS_LOGS_CHUNK_METHOD
+            | crate::peer_protocol::FWS_LOGS_IO_METADATA_METHOD
+            | crate::peer_protocol::FWS_LOGS_RESET_METHOD
+            | FWS_ERROR_METHOD
+    ) {
+        if let Some(shell_id) = notification
+            .get("params")
+            .and_then(Value::as_object)
+            .and_then(|params| params.get("shell_id"))
+            .and_then(Value::as_str)
+        {
+            let _ = socket
+                .to(shell_room(shell_id))
+                .emit(FWS_NOTIFICATION_EVENT, &notification)
+                .await;
+        }
+    }
+}
+
+async fn handle_browser_request(socket: SocketRef, request: Value, state: HostState) -> Value {
+    let request_id = request.get("id").and_then(Value::as_str).map(str::to_owned);
+    let method = request.get("method").and_then(Value::as_str).unwrap_or("");
+    let params = request.get("params").and_then(Value::as_object);
+
+    match method {
+        FWS_DASHBOARD_OPEN_METHOD => {
+            socket.join(FWS_DASHBOARD_ROOM);
+            dashboard_state_response(request_id, true, &state)
+        }
+        FWS_DASHBOARD_REFRESH_METHOD => dashboard_state_response(request_id, false, &state),
+        FWS_LOGS_OPEN_METHOD => {
+            let Some(shell_id) = params
+                .and_then(|params| params.get("shell_id"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+            else {
+                return jsonrpc_error(
+                    request_id,
+                    -32602,
+                    "shell_id is required",
+                    "invalid_params",
+                    None,
+                );
+            };
+            if let Err(error) = emit_logs_initial(&socket, &state, &shell_id).await {
+                return jsonrpc_error(
+                    request_id,
+                    -32004,
+                    &error.to_string(),
+                    "not_found",
+                    Some(&shell_id),
+                );
+            }
+            set_browser_log_shell(&socket, &state, Some(shell_id.clone())).await;
+            json!({"jsonrpc": "2.0", "id": request_id, "result": {"accepted": true, "shell_id": shell_id}})
+        }
+        FWS_LOGS_CLOSE_METHOD => {
+            let shell_id = params
+                .and_then(|params| params.get("shell_id"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if let Some(shell_id) = shell_id {
+                let current = state
+                    .socketio_runtime
+                    .browser_log_subscriptions
+                    .lock()
+                    .ok()
+                    .and_then(|subscriptions| subscriptions.get(&socket.id.to_string()).cloned());
+                if current.as_deref() == Some(shell_id.as_str()) {
+                    set_browser_log_shell(&socket, &state, None).await;
+                }
+            }
+            json!({"jsonrpc": "2.0", "id": request_id, "result": {"ok": true}})
+        }
+        FWS_SHELL_INPUT_METHOD => {
+            let Some(params) = params else {
+                return jsonrpc_error(
+                    request_id,
+                    -32602,
+                    "params are required",
+                    "invalid_params",
+                    None,
+                );
+            };
+            let Some(shell_id) = params.get("shell_id").and_then(Value::as_str) else {
+                return jsonrpc_error(
+                    request_id,
+                    -32602,
+                    "shell_id is required",
+                    "invalid_params",
+                    None,
+                );
+            };
+            let data = params.get("data").and_then(Value::as_str);
+            match write_shell_input_control(
+                &state,
+                shell_id,
+                data,
+                params
+                    .get("append_newline")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                params.get("eof").and_then(Value::as_bool).unwrap_or(false),
+                "dashboard",
+            )
+            .await
+            {
+                Ok(_) => json!({"jsonrpc": "2.0", "id": request_id, "result": {"ok": true}}),
+                Err(error) => jsonrpc_error(
+                    request_id,
+                    error.status.as_u16() as i64,
+                    &error.message,
+                    "action_failed",
+                    Some(shell_id),
+                ),
+            }
+        }
+        _ => jsonrpc_error(
+            request_id,
+            -32601,
+            &format!("Method not found: {method}"),
+            "method_not_found",
+            None,
+        ),
+    }
+}
+
+fn dashboard_state_response(
+    request_id: Option<String>,
+    accepted: bool,
+    state: &HostState,
+) -> Value {
+    let shells = state
+        .manager
+        .list_shells()
+        .map(|records| {
+            records
+                .into_iter()
+                .map(shell_payload)
+                .map(|payload| serde_json::to_value(payload).unwrap_or(Value::Null))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let result = if accepted {
+        json!({"accepted": true, "state": {"shells": shells, "processes": []}})
+    } else {
+        json!({"ok": true, "state": {"shells": shells, "processes": []}})
+    };
+    json!({"jsonrpc": "2.0", "id": request_id, "result": result})
+}
+
+async fn emit_logs_initial(socket: &SocketRef, state: &HostState, shell_id: &str) -> Result<()> {
+    let Some(record) = state.manager.get_shell(shell_id)? else {
+        return Err(anyhow!("Shell not found: {shell_id}"));
+    };
+    let stdout = read_log_text_lossy(&record.stdout_log)?;
+    let stderr = read_log_text_lossy(&record.stderr_log)?;
+    let notification = FwsJsonRpcNotification {
+        jsonrpc: "2.0".to_owned(),
+        method: FWS_LOGS_INITIAL_METHOD.to_owned(),
+        params: json!({
+            "shell_id": shell_id,
+            "stdout": stdout,
+            "stderr": stderr,
+            "io_metadata": []
+        }),
+    };
+    let _ = socket.emit(FWS_NOTIFICATION_EVENT, &notification);
+    Ok(())
+}
+
+async fn set_browser_log_shell(socket: &SocketRef, state: &HostState, shell_id: Option<String>) {
+    let sid = socket.id.to_string();
+    if let Some(previous_shell_id) = state
+        .socketio_runtime
+        .set_browser_log_shell(sid, shell_id.clone())
+    {
+        socket.leave(shell_room(&previous_shell_id));
+    }
+    if let Some(shell_id) = shell_id {
+        socket.join(shell_room(&shell_id));
+    }
+    broadcast_peer_subscriptions(state).await;
+}
+
+async fn write_shell_input_control(
+    state: &HostState,
+    shell_id: &str,
+    data: Option<&str>,
+    append_newline: bool,
+    eof: bool,
+    source: &str,
+) -> Result<Value, ApiError> {
+    if eof {
+        match state.manager.send_stdin_eof_blocking(shell_id) {
+            Ok(true) => return Ok(json!({"eof": true})),
+            Ok(false) => {}
+            Err(error) if local_input_error_can_fallback(&error) => {}
+            Err(error) => return Err(conflict_error(error)),
+        }
+    } else {
+        let Some(data) = data else {
+            return Err(bad_request("data is required unless eof=true"));
+        };
+        let mut bytes = data.as_bytes().to_vec();
+        if append_newline {
+            bytes.push(b'\n');
+        }
+        match state.manager.write_blocking(shell_id, &bytes) {
+            Ok(true) => {
+                return Ok(json!({
+                    "written": bytes.len(),
+                    "shell_id": shell_id,
+                    "accepted": true,
+                    "newline_appended": append_newline,
+                    "eof_sent": false
+                }));
+            }
+            Ok(false) => {}
+            Err(error) if local_input_error_can_fallback(&error) => {}
+            Err(error) => return Err(conflict_error(error)),
+        }
+    }
+
+    call_peer_shell_input(state, shell_id, data, append_newline, eof, source).await
+}
+
+async fn call_peer_shell_input(
+    state: &HostState,
+    shell_id: &str,
+    data: Option<&str>,
+    append_newline: bool,
+    eof: bool,
+    source: &str,
+) -> Result<Value, ApiError> {
+    if state.socketio_runtime.peer_count() == 0 {
+        return Err(not_found(format!(
+            "Live input unavailable for shell {shell_id}: no connected FWS peer owns live input"
+        )));
+    }
+    let Some(io) = &state.socketio else {
+        return Err(not_found(format!(
+            "Live input unavailable for shell {shell_id}: Socket.IO controller is unavailable"
+        )));
+    };
+    let Some(ns) = io.of(FWS_SOCKETIO_NAMESPACE) else {
+        return Err(not_found(format!(
+            "Live input unavailable for shell {shell_id}: namespace {FWS_SOCKETIO_NAMESPACE} is unavailable"
+        )));
+    };
+    let request = FwsPeerShellInputRequest::new(
+        shell_id.to_owned(),
+        data.unwrap_or_default().to_owned(),
+        append_newline,
+        eof,
+        source.to_owned(),
+    );
+    let ack_stream = ns
+        .within(FWS_PEER_ROOM)
+        .timeout(Duration::from_secs(3))
+        .emit_with_ack::<_, Value>(FWS_PEER_REQUEST_EVENT, &request)
+        .await
+        .map_err(|error| conflict_error(anyhow!("peer request send failed: {error}")))?;
+    futures_util::pin_mut!(ack_stream);
+
+    let mut fallback_errors = Vec::new();
+    while let Some((_sid, ack)) = ack_stream.next().await {
+        let value = match ack {
+            Ok(value) => value,
+            Err(error) => {
+                fallback_errors.push(error.to_string());
+                continue;
+            }
+        };
+        match parse_peer_response_value(value) {
+            PeerResponseValue::Accepted(data) => return Ok(data),
+            PeerResponseValue::Fallback => {}
+            PeerResponseValue::Failed(error) => fallback_errors.push(error),
+        }
+    }
+
+    if let Some(error) = fallback_errors.into_iter().next() {
+        return Err(conflict_error(anyhow!(error)));
+    }
+    Err(not_found(format!(
+        "Live input unavailable for shell {shell_id}: no connected FWS peer accepted the write"
+    )))
+}
+
+enum PeerResponseValue {
+    Accepted(Value),
+    Fallback,
+    Failed(String),
+}
+
+fn parse_peer_response_value(value: Value) -> PeerResponseValue {
+    let Some(mapping) = value.as_object() else {
+        return PeerResponseValue::Fallback;
+    };
+    if mapping.get("ok").and_then(Value::as_bool) == Some(true) {
+        return PeerResponseValue::Accepted(
+            mapping
+                .get("data")
+                .cloned()
+                .unwrap_or_else(|| json!({"ok": true})),
+        );
+    }
+    let code = mapping.get("code").and_then(Value::as_str).unwrap_or("");
+    if matches!(code, "not_owner" | "not_found") {
+        return PeerResponseValue::Fallback;
+    }
+    let error = mapping
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or("peer request failed");
+    PeerResponseValue::Failed(error.to_owned())
+}
+
+fn local_input_error_can_fallback(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    message.contains("not found")
+        || message.contains("not live")
+        || message.contains("does not expose")
+        || message.contains("unavailable")
+}
+
+async fn broadcast_peer_subscriptions(state: &HostState) {
+    let Some(io) = &state.socketio else {
+        return;
+    };
+    let Some(ns) = io.of(FWS_SOCKETIO_NAMESPACE) else {
+        return;
+    };
+    let payload = FwsPeerSubscriptions {
+        shell_ids: state.socketio_runtime.active_log_shell_ids(),
+    };
+    let _ = ns
+        .within(FWS_PEER_ROOM)
+        .emit(FWS_PEER_SUBSCRIPTIONS_EVENT, &payload)
+        .await;
+}
+
+fn read_log_text_lossy(path: &PathBuf) -> Result<String> {
+    if !path.exists() {
+        return Ok(String::new());
+    }
+    let mut file =
+        File::open(path).with_context(|| format!("failed to open log {}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn jsonrpc_error(
+    request_id: Option<String>,
+    code: i64,
+    message: &str,
+    error_code: &str,
+    shell_id: Option<&str>,
+) -> Value {
+    let mut data = Map::new();
+    data.insert(
+        "error_code".to_owned(),
+        Value::String(error_code.to_owned()),
+    );
+    if let Some(shell_id) = shell_id {
+        data.insert("shell_id".to_owned(), Value::String(shell_id.to_owned()));
+    }
+    json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "error": {
+            "code": code,
+            "message": message,
+            "data": Value::Object(data),
+        }
+    })
+}
+
 async fn health() -> Json<ApiEnvelope<Value>> {
     ok_json(serde_json::json!({ "status": "ok", "backend": "ferrous-native" }))
 }
@@ -369,10 +967,17 @@ async fn runtime_info(State(state): State<HostState>) -> Json<ApiEnvelope<HostIn
     let store = state.manager.store();
     ok_json(HostInfoPayload {
         backend: "ferrous-framework",
-        api_compat: "framework-shells-http-mvp",
+        api_compat: "framework-shells-http-socketio-mvp",
         transport_owner: "rust-native",
         python_runtime: false,
-        socketio: false,
+        socketio: state.socketio.is_some(),
+        socketio_namespace: FWS_SOCKETIO_NAMESPACE,
+        socketio_path: FWS_SOCKETIO_SOCKET_PATH,
+        peer_count: state.socketio_runtime.peer_count(),
+        peer_notifications_received: state
+            .socketio_runtime
+            .peer_notifications_received
+            .load(Ordering::Relaxed),
         url: state.base_url,
         store: StorePayload {
             runtime_id: store.runtime_id,
@@ -537,30 +1142,19 @@ async fn shell_input(
     if request.eof && request.data.as_deref().unwrap_or_default() != "" {
         return Err(bad_request("Provide either data or eof=true, not both"));
     }
-    if request.eof {
-        let sent = state
-            .manager
-            .send_stdin_eof_blocking(&shell_id)
-            .map_err(conflict_error)?;
-        if !sent {
-            return Err(not_found("Shell not found"));
-        }
-        return Ok(ok_json(serde_json::json!({ "eof": true })));
-    }
-    let Some(mut data) = request.data else {
+    if !request.eof && request.data.is_none() {
         return Err(bad_request("data is required unless eof=true"));
-    };
-    if request.append_newline {
-        data.push('\n');
     }
-    let written = state
-        .manager
-        .write_blocking(&shell_id, data.as_bytes())
-        .map_err(conflict_error)?;
-    if !written {
-        return Err(not_found("Shell not found"));
-    }
-    Ok(ok_json(serde_json::json!({ "written": data.len() })))
+    let result = write_shell_input_control(
+        &state,
+        &shell_id,
+        request.data.as_deref(),
+        request.append_newline,
+        request.eof,
+        "http",
+    )
+    .await?;
+    Ok(ok_json(result))
 }
 
 async fn log_tail(

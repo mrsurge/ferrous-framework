@@ -10,6 +10,7 @@ description = "Rust runtime path for framework-shells-compatible process managem
 [dependencies]
 anyhow = "1"
 axum = "0.8"
+futures-util = "0.3"
 getrandom = "0.3"
 hmac = "0.12"
 nix = { version = "0.30", features = ["fs", "poll", "process", "term"] }
@@ -19,4 +20,6 @@ serde_json = "1"
 serde_yaml = "0.9"
 sha2 = "0.10"
 shlex = "1"
+socketioxide = "0.18.3"
+tf-rust-socketio = "0.8.1"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time"] }

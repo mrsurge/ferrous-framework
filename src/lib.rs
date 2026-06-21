@@ -1,11 +1,14 @@
 pub mod native_host;
+pub mod native_peer;
 pub mod native_runtime;
+pub mod peer_protocol;
 pub mod shellspec;
 pub mod shutdown;
 
 pub use native_host::{
     FerrousNativeHost, FerrousNativeHostConfig, derive_api_token as derive_native_api_token,
 };
+pub use native_peer::{FerrousNativePeer, FerrousNativePeerConfig};
 pub use native_runtime::{
     FerrousFrameworkPipe, FerrousNativeEnv, FerrousNativeManager, FerrousNativeOutputChunk,
     FerrousNativeOutputStream, FerrousNativeOutputSubscription, FerrousNativePipeConfig,
