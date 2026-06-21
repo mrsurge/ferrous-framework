@@ -1,8 +1,9 @@
 use ferrous_framework::{
-    FerrousFrameworkPipe, FerrousNativeEnv, FerrousNativeManager, FerrousNativeOutputStream,
-    FerrousNativePipeConfig, FerrousNativeProcConfig, FerrousNativePtyConfig, FerrousNativePtyMode,
-    FerrousNativeShellStatus, FerrousNativeStore, FerrousPipeConfig, FerrousShellLaunchOverrides,
-    load_persisted_record, shellspec::ShellspecRenderInput,
+    FerrousFrameworkPipe, FerrousNativeEnv, FerrousNativeLifecycleEventKind, FerrousNativeManager,
+    FerrousNativeOutputStream, FerrousNativePipeConfig, FerrousNativeProcConfig,
+    FerrousNativePtyConfig, FerrousNativePtyMode, FerrousNativeShellStatus, FerrousNativeStore,
+    FerrousPipeConfig, FerrousShellLaunchOverrides, load_persisted_record,
+    shellspec::ShellspecRenderInput,
 };
 use serde_json::{Value, json};
 use std::{
@@ -1160,6 +1161,45 @@ fn terminates_running_proc() {
 }
 
 #[test]
+fn lifecycle_subscription_reports_spawn_and_exit() {
+    let manager = test_manager_with_store("lifecycle-subscription");
+    let mut lifecycle = manager.subscribe_lifecycle();
+    let record = manager
+        .spawn_proc_blocking(base_proc_config(
+            vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "printf lifecycle".to_owned(),
+            ],
+            test_log_dir("lifecycle-subscription-proc"),
+        ))
+        .expect("spawn proc");
+
+    let spawned = lifecycle.try_recv().expect("spawn lifecycle event");
+    assert_eq!(spawned.kind, FerrousNativeLifecycleEventKind::Spawned);
+    assert_eq!(spawned.shell_id, record.id);
+
+    manager
+        .wait_shell_blocking(&record.id, Duration::from_secs(3))
+        .expect("wait shell")
+        .expect("shell record");
+    let started = Instant::now();
+    loop {
+        if let Ok(event) = lifecycle.try_recv() {
+            if event.kind == FerrousNativeLifecycleEventKind::Exited {
+                assert_eq!(event.shell_id, record.id);
+                break;
+            }
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "timed out waiting for exited lifecycle event"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
 fn shutdown_tree_with_empty_roots_terminates_all_live_roots() {
     let manager = FerrousNativeManager::new();
     let first = manager
@@ -1180,8 +1220,10 @@ fn shutdown_tree_with_empty_roots_terminates_all_live_roots() {
         .expect("shutdown all roots through tree hook");
     assert!(result.ok, "shutdown errors: {:?}", result.stats.errors);
     assert_eq!(result.kind, "shutdown_tree");
-    assert_eq!(result.target, "all");
-    assert!(result.root_pids.is_empty());
+    assert_eq!(
+        result.root_pids,
+        vec![i64::from(first.pid), i64::from(second.pid)]
+    );
     assert_eq!(result.stats.total, 2);
     assert_eq!(result.stats.terminated, 2);
 
@@ -1192,6 +1234,70 @@ fn shutdown_tree_with_empty_roots_terminates_all_live_roots() {
             .expect("shell record");
         assert_eq!(exited.status, FerrousNativeShellStatus::Exited);
     }
+}
+
+#[test]
+fn shutdown_tree_kills_descendants_and_marks_adopted_python_record() {
+    let manager = test_manager_with_store("shutdown-tree-mixed-python");
+    let app_id = "mixed-python-app";
+    let log_dir = test_log_dir("shutdown-tree-mixed-python-logs");
+    let mut config = base_proc_config(
+        vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "sleep 30 & printf 'child:%s\\n' \"$!\"; wait".to_owned(),
+        ],
+        log_dir,
+    );
+    config.label = format!("app-worker:{app_id}");
+    config.spec_id = format!("app:{app_id}:worker");
+    config.subgroups = vec![app_id.to_owned(), "app-worker".to_owned()];
+    let root = manager.spawn_proc_blocking(config).expect("spawn root");
+    let child_line = eventually_read_to_string(&root.stdout_log, Duration::from_secs(3));
+    let child_pid = child_line
+        .trim()
+        .strip_prefix("child:")
+        .expect("child pid line")
+        .parse::<i64>()
+        .expect("child pid");
+    assert!(test_pid_is_live(child_pid), "child process should be live");
+
+    let adopted_id = "fs_python_managed_child";
+    let adopted_dir = manager.store().metadata_dir.join(adopted_id);
+    fs::create_dir_all(&adopted_dir).expect("adopted record dir");
+    let adopted_path = adopted_dir.join("meta.json");
+    fs::write(
+        &adopted_path,
+        json!({
+            "id": adopted_id,
+            "backend": "proc",
+            "pid": child_pid,
+            "status": "running",
+            "label": "python-managed-child",
+            "subgroups": [app_id],
+            "record_path": adopted_path.to_string_lossy(),
+            "stdout_log": manager.store().logs_dir.join(format!("{adopted_id}.stdout.log")).to_string_lossy(),
+            "stderr_log": manager.store().logs_dir.join(format!("{adopted_id}.stderr.log")).to_string_lossy(),
+            "app_id": app_id,
+            "created_at": 1.0,
+            "updated_at": 1.0
+        })
+        .to_string(),
+    )
+    .expect("write adopted python record");
+
+    let result = manager
+        .shutdown_tree_blocking(vec![i64::from(root.pid)])
+        .expect("shutdown mixed tree");
+    assert!(result.ok, "shutdown errors: {:?}", result.stats.errors);
+    assert!(
+        result.stats.total >= 2,
+        "tree plan should include root and child: {result:?}"
+    );
+    assert!(!test_pid_is_live(child_pid), "child process should exit");
+
+    let adopted = load_persisted_record(&adopted_path).expect("load adopted record");
+    assert_eq!(adopted.status, FerrousNativeShellStatus::Exited);
 }
 
 #[test]
@@ -2345,6 +2451,23 @@ fn read_chunks_until_contains(
     } else {
         Ok(Some(String::from_utf8_lossy(&out).into_owned()))
     }
+}
+
+fn test_pid_is_live(pid: i64) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    let stat_path = PathBuf::from(format!("/proc/{pid}/stat"));
+    let Ok(stat) = fs::read_to_string(stat_path) else {
+        return false;
+    };
+    let Some((_, after_comm)) = stat.rsplit_once(") ") else {
+        return false;
+    };
+    let Some(state) = after_comm.chars().next() else {
+        return false;
+    };
+    !matches!(state, 'Z' | 'X')
 }
 
 fn eventually_read_to_string(path: &PathBuf, timeout: Duration) -> String {

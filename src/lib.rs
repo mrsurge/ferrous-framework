@@ -10,7 +10,8 @@ pub use native_host::{
 };
 pub use native_peer::{FerrousNativePeer, FerrousNativePeerConfig};
 pub use native_runtime::{
-    FerrousFrameworkPipe, FerrousNativeEnv, FerrousNativeManager, FerrousNativeOutputChunk,
+    FerrousFrameworkPipe, FerrousNativeEnv, FerrousNativeLifecycleEvent,
+    FerrousNativeLifecycleEventKind, FerrousNativeManager, FerrousNativeOutputChunk,
     FerrousNativeOutputStream, FerrousNativeOutputSubscription, FerrousNativePipeConfig,
     FerrousNativePipeState, FerrousNativeProcConfig, FerrousNativePtyConfig, FerrousNativePtyMode,
     FerrousNativeShellCapabilities, FerrousNativeShellRecord, FerrousNativeShellStatus,

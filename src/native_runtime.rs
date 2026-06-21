@@ -35,6 +35,7 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use tokio::sync::broadcast;
 
 const FRAMEWORK_SHELLS_SECRET_KEY: &str = "FRAMEWORK_SHELLS_SECRET";
 const FRAMEWORK_SHELLS_RUN_ID_KEY: &str = "FRAMEWORK_SHELLS_RUN_ID";
@@ -111,6 +112,20 @@ pub struct FerrousShellInputResult {
 
 pub struct FerrousNativeOutputSubscription {
     rx: Receiver<FerrousNativeOutputChunk>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FerrousNativeLifecycleEventKind {
+    Spawned,
+    Updated,
+    Exited,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FerrousNativeLifecycleEvent {
+    pub kind: FerrousNativeLifecycleEventKind,
+    pub shell_id: String,
+    pub shell: FerrousNativeShellRecord,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
@@ -242,6 +257,7 @@ pub struct FerrousPipeConfig {
 pub struct FerrousNativeManager {
     state: Arc<Mutex<ManagerState>>,
     subscriptions: Arc<Mutex<OutputSubscriptions>>,
+    lifecycle_tx: broadcast::Sender<FerrousNativeLifecycleEvent>,
     reactor: NativeRuntimeReactor,
     store: FerrousNativeStore,
     native_env: FerrousNativeEnv,
@@ -393,13 +409,21 @@ struct ReactorChild {
     child: Arc<Mutex<Child>>,
 }
 
+#[derive(Clone, Debug)]
+struct ProcfsEntry {
+    pid: i64,
+    ppid: i64,
+    state: char,
+}
+
 impl NativeRuntimeReactor {
     fn start(
         state: Arc<Mutex<ManagerState>>,
         subscriptions: Arc<Mutex<OutputSubscriptions>>,
+        lifecycle_tx: broadcast::Sender<FerrousNativeLifecycleEvent>,
     ) -> Self {
         let (tx, rx) = channel::<ReactorCommand>();
-        thread::spawn(move || reactor_loop(state, subscriptions, rx));
+        thread::spawn(move || reactor_loop(state, subscriptions, lifecycle_tx, rx));
         Self { tx }
     }
 
@@ -473,10 +497,16 @@ impl FerrousNativeManager {
     pub fn with_store_and_env(store: FerrousNativeStore, native_env: FerrousNativeEnv) -> Self {
         let state = Arc::new(Mutex::new(ManagerState::default()));
         let subscriptions = Arc::new(Mutex::new(OutputSubscriptions::default()));
-        let reactor = NativeRuntimeReactor::start(Arc::clone(&state), Arc::clone(&subscriptions));
+        let (lifecycle_tx, _) = broadcast::channel(1024);
+        let reactor = NativeRuntimeReactor::start(
+            Arc::clone(&state),
+            Arc::clone(&subscriptions),
+            lifecycle_tx.clone(),
+        );
         Self {
             state,
             subscriptions,
+            lifecycle_tx,
             reactor,
             store,
             native_env,
@@ -562,6 +592,10 @@ impl FerrousNativeManager {
         capacity: usize,
     ) -> Result<Option<FerrousNativeOutputSubscription>> {
         self.subscribe_output(shell_id, FerrousNativeOutputStream::Stdout, capacity)
+    }
+
+    pub fn subscribe_lifecycle(&self) -> broadcast::Receiver<FerrousNativeLifecycleEvent> {
+        self.lifecycle_tx.subscribe()
     }
 
     pub fn spawn_shellspec_entry_blocking(
@@ -864,6 +898,7 @@ impl FerrousNativeManager {
             None,
         )?;
         self.reactor.watch_child(id, child)?;
+        self.publish_lifecycle(FerrousNativeLifecycleEventKind::Spawned, record.clone());
         Ok(record)
     }
 
@@ -996,6 +1031,7 @@ impl FerrousNativeManager {
             None,
         )?;
         self.reactor.watch_child(id, child)?;
+        self.publish_lifecycle(FerrousNativeLifecycleEventKind::Spawned, record.clone());
         Ok(record)
     }
 
@@ -1123,6 +1159,7 @@ impl FerrousNativeManager {
             Some(Arc::new(File::from(master_resize))),
         )?;
         self.reactor.watch_child(id, child)?;
+        self.publish_lifecycle(FerrousNativeLifecycleEventKind::Spawned, record.clone());
         Ok(record)
     }
 
@@ -1320,7 +1357,7 @@ impl FerrousNativeManager {
     }
 
     pub fn send_stdin_eof_blocking(&self, shell_id: &str) -> Result<bool> {
-        let input = {
+        let (input, updated_record) = {
             let mut state = self.lock_state()?;
             let Some(entry) = state.entries.get_mut(shell_id) else {
                 return Ok(false);
@@ -1332,9 +1369,10 @@ impl FerrousNativeManager {
             entry.record.capabilities.stdin_eof = false;
             entry.record.updated_at_ms = now_ms();
             persist_record(&entry.record, &entry.record_path)?;
-            input
+            (input, entry.record.clone())
         };
         drop(input);
+        self.publish_lifecycle(FerrousNativeLifecycleEventKind::Updated, updated_record);
         Ok(true)
     }
 
@@ -1417,53 +1455,49 @@ impl FerrousNativeManager {
     pub fn shutdown_app_group_blocking(&self, app_id: &str) -> Result<FerrousShutdownResult> {
         let started_at_ms = now_ms() as u64;
         let targets = self
-            .live_records()?
+            .running_fws_records()?
             .into_iter()
-            .filter(|record| {
-                record.status == FerrousNativeShellStatus::Running
-                    && record.app_id.as_deref() == Some(app_id)
-            })
+            .filter(|record| record.app_id.as_deref() == Some(app_id))
             .collect::<Vec<_>>();
         let root_pids = targets
             .iter()
             .map(|record| i64::from(record.pid))
             .collect::<Vec<_>>();
-        self.shutdown_records_blocking(
+        self.shutdown_process_tree_blocking(
             "shutdown_group",
             app_id,
             root_pids,
-            targets,
-            "Ferrous MVP group shutdown terminates Ferrous-owned live shell roots only",
+            "Ferrous native group shutdown terminates matching FWS roots and descendants",
             started_at_ms,
         )
     }
 
     pub fn shutdown_tree_blocking(&self, root_pids: Vec<i64>) -> Result<FerrousShutdownResult> {
         let started_at_ms = now_ms() as u64;
-        let target_filter = root_pids.iter().copied().collect::<HashSet<_>>();
-        let targets = self
-            .live_records()?
-            .into_iter()
-            .filter(|record| record.status == FerrousNativeShellStatus::Running)
-            .filter(|record| {
-                target_filter.is_empty() || target_filter.contains(&i64::from(record.pid))
-            })
-            .collect::<Vec<_>>();
-        let target = if root_pids.is_empty() {
-            "all".to_owned()
+        let selected_roots = if root_pids.is_empty() {
+            self.live_records()?
+                .iter()
+                .filter(|record| record.status == FerrousNativeShellStatus::Running)
+                .filter(|record| pid_is_live_i64(i64::from(record.pid)))
+                .map(|record| i64::from(record.pid))
+                .collect::<Vec<_>>()
         } else {
             root_pids
+        };
+        let target = if selected_roots.is_empty() {
+            "all".to_owned()
+        } else {
+            selected_roots
                 .iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>()
                 .join(",")
         };
-        self.shutdown_records_blocking(
+        self.shutdown_process_tree_blocking(
             "shutdown_tree",
             &target,
-            root_pids,
-            targets,
-            "Ferrous MVP tree shutdown terminates Ferrous-owned live shell roots only",
+            selected_roots,
+            "Ferrous native tree shutdown terminates manager-owned roots and descendants",
             started_at_ms,
         )
     }
@@ -1473,54 +1507,121 @@ impl FerrousNativeManager {
         result.kind = "shutdown_all".to_owned();
         result.target = "all".to_owned();
         result.note = Some(
-            "Ferrous MVP all shutdown terminates Ferrous-owned live shell roots only".to_owned(),
+            "Ferrous native all shutdown terminates manager-owned roots and descendants".to_owned(),
         );
         Ok(result)
     }
 
-    fn shutdown_records_blocking(
+    fn shutdown_process_tree_blocking(
         &self,
         kind: &str,
         target: &str,
         root_pids: Vec<i64>,
-        targets: Vec<FerrousNativeShellRecord>,
         note: &str,
         started_at_ms: u64,
     ) -> Result<FerrousShutdownResult> {
+        let running_records = self.running_fws_records()?;
+        let root_pids = normalize_pids(root_pids);
+        let snapshot = procfs_snapshot();
+        let protected = protected_process_pids(&snapshot);
+        let mut events = Vec::new();
+        let plan = shutdown_plan_pids(&root_pids, &snapshot);
+        let mut kill_plan = Vec::new();
+        for pid in plan {
+            if protected.contains(&pid) {
+                events.push(format!("skipped protected pid {pid}"));
+            } else {
+                kill_plan.push(pid);
+            }
+        }
         let mut stats = FerrousShutdownStats {
-            total: targets.len() as u64,
+            total: kill_plan.len() as u64,
             ..FerrousShutdownStats::default()
         };
-        let mut events = Vec::new();
-        for record in targets {
-            match self.terminate_shell_blocking(&record.id) {
+
+        let mut term_sent = Vec::new();
+        for pid in &kill_plan {
+            if !pid_is_live_i64(*pid) {
+                events.push(format!("pid {pid} already exited"));
+                continue;
+            }
+            match signal_pid(*pid, libc::SIGTERM) {
                 Ok(true) => {
                     stats.terminated += 1;
-                    events.push(format!("terminated shell {}", record.id));
-                    match self.wait_shell_blocking(&record.id, Duration::from_secs(2)) {
-                        Ok(Some(exited)) if exited.status == FerrousNativeShellStatus::Exited => {
-                            stats.force_killed += 1;
-                        }
-                        Ok(_) => {
-                            stats.force_killed += 1;
-                            events.push(format!(
-                                "shell {} did not report exit before timeout",
-                                record.id
-                            ));
-                        }
-                        Err(error) => {
-                            stats.errors.push(format!("{}: {}", record.id, error));
-                        }
-                    }
+                    term_sent.push(*pid);
+                    events.push(format!("sent SIGTERM to pid {pid}"));
                 }
                 Ok(false) => {
-                    stats.errors.push(format!("{}: not live", record.id));
+                    events.push(format!("pid {pid} exited before SIGTERM"));
                 }
                 Err(error) => {
-                    stats.errors.push(format!("{}: {}", record.id, error));
+                    stats.errors.push(format!("pid {pid}: {error}"));
                 }
             }
         }
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if term_sent.iter().all(|pid| !pid_is_live_i64(*pid)) {
+                break;
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        let survivors = term_sent
+            .iter()
+            .copied()
+            .filter(|pid| pid_is_live_i64(*pid))
+            .collect::<Vec<_>>();
+        stats.clean_exits = term_sent.len().saturating_sub(survivors.len()) as u64;
+
+        for pid in &survivors {
+            match signal_pid(*pid, libc::SIGKILL) {
+                Ok(true) => {
+                    stats.force_killed += 1;
+                    events.push(format!("sent SIGKILL to pid {pid}"));
+                }
+                Ok(false) => {
+                    events.push(format!("pid {pid} exited before SIGKILL"));
+                }
+                Err(error) => {
+                    stats.errors.push(format!("pid {pid}: {error}"));
+                }
+            }
+        }
+
+        if !survivors.is_empty() {
+            let kill_deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                if survivors.iter().all(|pid| !pid_is_live_i64(*pid)) {
+                    break;
+                }
+                if Instant::now() >= kill_deadline {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        for record in running_records {
+            let pid = i64::from(record.pid);
+            if kill_plan.contains(&pid) && !pid_is_live_i64(pid) {
+                let exit_code = if survivors.contains(&pid) {
+                    Some(-libc::SIGKILL)
+                } else {
+                    Some(-libc::SIGTERM)
+                };
+                if let Err(error) = self.mark_record_exited(&record, exit_code) {
+                    stats
+                        .errors
+                        .push(format!("{}: failed to mark exited: {error}", record.id));
+                }
+            }
+        }
+
         let ended_at_ms = now_ms() as u64;
         Ok(FerrousShutdownResult {
             ok: stats.errors.is_empty(),
@@ -1534,6 +1635,49 @@ impl FerrousNativeManager {
             events,
             note: Some(note.to_owned()),
         })
+    }
+
+    fn running_fws_records(&self) -> Result<Vec<FerrousNativeShellRecord>> {
+        Ok(self
+            .list_shells()?
+            .into_iter()
+            .filter(|record| {
+                record.status == FerrousNativeShellStatus::Running
+                    && pid_is_live_i64(i64::from(record.pid))
+            })
+            .collect())
+    }
+
+    fn mark_record_exited(
+        &self,
+        fallback: &FerrousNativeShellRecord,
+        exit_code: Option<i32>,
+    ) -> Result<()> {
+        let updated = {
+            let mut state = self.lock_state()?;
+            if let Some(entry) = state.entries.get_mut(&fallback.id) {
+                entry.record.status = FerrousNativeShellStatus::Exited;
+                entry.record.exit_code = exit_code;
+                entry.record.updated_at_ms = now_ms();
+                persist_record(&entry.record, &entry.record_path)?;
+                Some(entry.record.clone())
+            } else {
+                None
+            }
+        };
+        let updated = match updated {
+            Some(record) => record,
+            None => {
+                let mut record = fallback.clone();
+                record.status = FerrousNativeShellStatus::Exited;
+                record.exit_code = exit_code;
+                record.updated_at_ms = now_ms();
+                persist_record(&record, &record.record_path)?;
+                record
+            }
+        };
+        self.publish_lifecycle(FerrousNativeLifecycleEventKind::Exited, updated);
+        Ok(())
     }
 
     fn output_for(&self, shell_id: &str) -> Result<Option<Arc<Mutex<DirectOutput>>>> {
@@ -1593,6 +1737,18 @@ impl FerrousNativeManager {
             },
         );
         Ok(())
+    }
+
+    fn publish_lifecycle(
+        &self,
+        kind: FerrousNativeLifecycleEventKind,
+        shell: FerrousNativeShellRecord,
+    ) {
+        let _ = self.lifecycle_tx.send(FerrousNativeLifecycleEvent {
+            shell_id: shell.id.clone(),
+            kind,
+            shell,
+        });
     }
 
     fn next_shell_id(&self) -> Result<String> {
@@ -2210,10 +2366,122 @@ fn pid_is_live(pid: u32) -> bool {
     )
 }
 
+fn pid_is_live_i64(pid: i64) -> bool {
+    u32::try_from(pid).ok().is_some_and(pid_is_live)
+}
+
 fn linux_proc_pid_state(pid: u32) -> Option<char> {
+    linux_proc_stat(pid).map(|entry| entry.state)
+}
+
+fn linux_proc_stat(pid: u32) -> Option<ProcfsEntry> {
     let stat = read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let (_, after_comm) = stat.rsplit_once(") ")?;
-    after_comm.chars().next()
+    let mut fields = after_comm.split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    let ppid = fields.next()?.parse::<i64>().ok()?;
+    Some(ProcfsEntry {
+        pid: i64::from(pid),
+        ppid,
+        state,
+    })
+}
+
+fn procfs_snapshot() -> HashMap<i64, ProcfsEntry> {
+    let mut processes = HashMap::new();
+    if !Path::new("/proc").is_dir() {
+        return processes;
+    }
+    let Ok(entries) = read_dir("/proc") else {
+        return processes;
+    };
+    for entry in entries.flatten() {
+        let Some(file_name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Ok(pid) = file_name.parse::<u32>() else {
+            continue;
+        };
+        let Some(process) = linux_proc_stat(pid) else {
+            continue;
+        };
+        if matches!(process.state, 'Z' | 'X') {
+            continue;
+        }
+        processes.insert(process.pid, process);
+    }
+    processes
+}
+
+fn protected_process_pids(snapshot: &HashMap<i64, ProcfsEntry>) -> HashSet<i64> {
+    let mut protected = HashSet::new();
+    let mut current = i64::from(std::process::id());
+    while current > 0 && protected.insert(current) {
+        let Some(entry) = snapshot.get(&current) else {
+            break;
+        };
+        current = entry.ppid;
+    }
+    protected
+}
+
+fn normalize_pids(mut pids: Vec<i64>) -> Vec<i64> {
+    pids.retain(|pid| *pid > 0);
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
+fn shutdown_plan_pids(root_pids: &[i64], snapshot: &HashMap<i64, ProcfsEntry>) -> Vec<i64> {
+    let roots = root_pids.iter().copied().collect::<HashSet<_>>();
+    let mut selected = roots.clone();
+    loop {
+        let mut changed = false;
+        for process in snapshot.values() {
+            if selected.contains(&process.ppid) && selected.insert(process.pid) {
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut plan = selected.into_iter().collect::<Vec<_>>();
+    plan.sort_by(|left, right| {
+        process_depth(*right, snapshot, &roots)
+            .cmp(&process_depth(*left, snapshot, &roots))
+            .then_with(|| right.cmp(left))
+    });
+    plan
+}
+
+fn process_depth(pid: i64, snapshot: &HashMap<i64, ProcfsEntry>, roots: &HashSet<i64>) -> usize {
+    let mut depth = 0;
+    let mut current = pid;
+    let mut seen = HashSet::new();
+    while !roots.contains(&current) && seen.insert(current) {
+        let Some(entry) = snapshot.get(&current) else {
+            break;
+        };
+        current = entry.ppid;
+        depth += 1;
+    }
+    depth
+}
+
+fn signal_pid(pid: i64, signal: libc::c_int) -> Result<bool> {
+    if pid <= 0 || pid > i64::from(i32::MAX) {
+        bail!("invalid pid {pid}");
+    }
+    let result = unsafe { libc::kill(pid as libc::pid_t, signal) };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(false);
+    }
+    Err(error).with_context(|| format!("failed to signal pid {pid}"))
 }
 
 fn limit_exited_shell_history(
@@ -2681,6 +2949,7 @@ fn take_line(buffer: &mut Vec<u8>) -> Option<String> {
 fn reactor_loop(
     state: Arc<Mutex<ManagerState>>,
     subscriptions: Arc<Mutex<OutputSubscriptions>>,
+    lifecycle_tx: broadcast::Sender<FerrousNativeLifecycleEvent>,
     rx: Receiver<ReactorCommand>,
 ) {
     let mut streams = Vec::<ReactorLogStream>::new();
@@ -2700,13 +2969,13 @@ fn reactor_loop(
                 handle_reactor_command(command, &mut streams, &mut children);
                 drain_reactor_commands(&rx, &mut streams, &mut children);
             }
-            check_reactor_children(&state, &mut children);
+            check_reactor_children(&state, &lifecycle_tx, &mut children);
             continue;
         }
 
         drain_reactor_commands(&rx, &mut streams, &mut children);
         poll_reactor_streams(&mut streams, &subscriptions, Duration::from_millis(25));
-        check_reactor_children(&state, &mut children);
+        check_reactor_children(&state, &lifecycle_tx, &mut children);
     }
 }
 
@@ -2846,7 +3115,11 @@ fn broadcast_output(
     subscriptions.dropped.insert(key, dropped_count);
 }
 
-fn check_reactor_children(state: &Arc<Mutex<ManagerState>>, children: &mut Vec<ReactorChild>) {
+fn check_reactor_children(
+    state: &Arc<Mutex<ManagerState>>,
+    lifecycle_tx: &broadcast::Sender<FerrousNativeLifecycleEvent>,
+    children: &mut Vec<ReactorChild>,
+) {
     let mut exited = Vec::<(usize, i32)>::new();
     for (index, child_entry) in children.iter().enumerate() {
         let exit_code = {
@@ -2866,13 +3139,22 @@ fn check_reactor_children(state: &Arc<Mutex<ManagerState>>, children: &mut Vec<R
     }
     for (index, exit_code) in exited.into_iter().rev() {
         let child_entry = children.swap_remove(index);
+        let mut updated_record = None;
         if let Ok(mut state) = state.lock() {
             if let Some(entry) = state.entries.get_mut(&child_entry.shell_id) {
                 entry.record.status = FerrousNativeShellStatus::Exited;
                 entry.record.exit_code = Some(exit_code);
                 entry.record.updated_at_ms = now_ms();
                 let _ = persist_record(&entry.record, &entry.record_path);
+                updated_record = Some(entry.record.clone());
             }
+        }
+        if let Some(shell) = updated_record {
+            let _ = lifecycle_tx.send(FerrousNativeLifecycleEvent {
+                shell_id: shell.id.clone(),
+                kind: FerrousNativeLifecycleEventKind::Exited,
+                shell,
+            });
         }
     }
 }

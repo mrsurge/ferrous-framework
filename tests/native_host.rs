@@ -159,7 +159,9 @@ fn native_host_serves_control_plane_and_shell_io() {
     let shutdown = json_body(&body);
     assert_eq!(shutdown["data"]["kind"], "shutdown_group");
     assert_eq!(shutdown["data"]["stats"]["total"], 1);
-    assert_eq!(shutdown["data"]["stats"]["force_killed"], 1);
+    assert_eq!(shutdown["data"]["stats"]["terminated"], 1);
+    assert_eq!(shutdown["data"]["stats"]["clean_exits"], 1);
+    assert_eq!(shutdown["data"]["stats"]["force_killed"], 0);
 
     host.close_blocking().expect("close host");
 }

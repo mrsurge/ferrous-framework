@@ -1,6 +1,7 @@
 use crate::native_runtime::{
-    FerrousNativeManager, FerrousNativePipeConfig, FerrousNativeProcConfig, FerrousNativePtyConfig,
-    FerrousNativePtyMode, FerrousNativeShellRecord, FerrousNativeShellStatus, FerrousNativeStore,
+    FerrousNativeLifecycleEvent, FerrousNativeLifecycleEventKind, FerrousNativeManager,
+    FerrousNativePipeConfig, FerrousNativeProcConfig, FerrousNativePtyConfig, FerrousNativePtyMode,
+    FerrousNativeShellRecord, FerrousNativeShellStatus, FerrousNativeStore,
 };
 use crate::peer_protocol::{
     FWS_BROWSER_ROLE, FWS_DASHBOARD_OPEN_METHOD, FWS_DASHBOARD_REFRESH_METHOD, FWS_DASHBOARD_ROOM,
@@ -380,6 +381,7 @@ fn run_host_thread(
             .build_layer();
         state.socketio = Some(io.clone());
         register_fws_socketio_namespace(&io, state.clone());
+        start_lifecycle_forwarder(io.clone(), state.clone());
 
         let listener = tokio::net::TcpListener::from_std(listener)
             .context("failed to attach native host listener to tokio")?;
@@ -493,6 +495,39 @@ fn register_fws_socketio_namespace(io: &SocketIo, state: HostState) {
             }
         },
     );
+}
+
+fn start_lifecycle_forwarder(io: SocketIo, state: HostState) {
+    let mut events = state.manager.subscribe_lifecycle();
+    tokio::spawn(async move {
+        loop {
+            match events.recv().await {
+                Ok(event) => emit_shell_lifecycle(&io, event).await,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+}
+
+async fn emit_shell_lifecycle(io: &SocketIo, event: FerrousNativeLifecycleEvent) {
+    let Some(ns) = io.of(FWS_SOCKETIO_NAMESPACE) else {
+        return;
+    };
+    let method = match event.kind {
+        FerrousNativeLifecycleEventKind::Spawned => "fws.shell.spawned",
+        FerrousNativeLifecycleEventKind::Updated => "fws.shell.updated",
+        FerrousNativeLifecycleEventKind::Exited => "fws.shell.exited",
+    };
+    let notification = FwsJsonRpcNotification {
+        jsonrpc: "2.0".to_owned(),
+        method: method.to_owned(),
+        params: json!({ "shell": shell_payload(event.shell) }),
+    };
+    let _ = ns
+        .within(FWS_DASHBOARD_ROOM)
+        .emit(FWS_NOTIFICATION_EVENT, &notification)
+        .await;
 }
 
 async fn handle_fws_socketio_connect(socket: SocketRef, auth: Option<Value>, state: HostState) {
