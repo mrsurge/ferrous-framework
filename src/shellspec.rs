@@ -16,6 +16,8 @@ pub struct RenderedShellSpec {
     pub cwd: Option<PathBuf>,
     pub env: HashMap<String, String>,
     pub subgroups: Vec<String>,
+    pub ui: Map<String, Value>,
+    pub debug: Map<String, Value>,
     pub pty_mode: String,
     pub autostart: bool,
     pub readiness: Option<RenderedReadinessProbe>,
@@ -95,6 +97,8 @@ pub fn parse_shellspec_entry(document: &Value, entry: &str) -> Result<RenderedSh
         .map(PathBuf::from);
     let env = parse_string_map(shell.get("env"));
     let subgroups = parse_string_list(shell.get("subgroups"));
+    let ui = parse_object_map(shell.get("ui"));
+    let debug = parse_object_map(shell.get("debug"));
     let pty_mode = shell
         .get("pty_mode")
         .and_then(Value::as_str)
@@ -112,6 +116,8 @@ pub fn parse_shellspec_entry(document: &Value, entry: &str) -> Result<RenderedSh
         cwd,
         env,
         subgroups,
+        ui,
+        debug,
         pty_mode,
         autostart,
         readiness,
@@ -184,6 +190,13 @@ fn parse_string_map(value: Option<&Value>) -> HashMap<String, String> {
                 })
                 .collect()
         })
+        .unwrap_or_default()
+}
+
+fn parse_object_map(value: Option<&Value>) -> Map<String, Value> {
+    value
+        .and_then(Value::as_object)
+        .cloned()
         .unwrap_or_default()
 }
 

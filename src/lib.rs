@@ -14,7 +14,7 @@ pub use native_runtime::{
     FerrousNativeOutputStream, FerrousNativeOutputSubscription, FerrousNativePipeConfig,
     FerrousNativePipeState, FerrousNativeProcConfig, FerrousNativePtyConfig, FerrousNativePtyMode,
     FerrousNativeShellCapabilities, FerrousNativeShellRecord, FerrousNativeShellStatus,
-    FerrousNativeStore, FerrousPipeConfig, FerrousShellInputResult, ferrous_native_enabled,
-    load_persisted_record, pyo3_embed_enabled,
+    FerrousNativeStore, FerrousPipeConfig, FerrousShellInputResult, FerrousShellLaunchOverrides,
+    ferrous_native_enabled, load_persisted_record, pyo3_embed_enabled,
 };
 pub use shutdown::{FerrousShutdownResult, FerrousShutdownStats};

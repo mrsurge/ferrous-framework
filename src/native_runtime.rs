@@ -26,6 +26,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{
         Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
         mpsc::{
             Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError, channel,
             sync_channel,
@@ -39,6 +40,7 @@ const FRAMEWORK_SHELLS_SECRET_KEY: &str = "FRAMEWORK_SHELLS_SECRET";
 const FRAMEWORK_SHELLS_RUN_ID_KEY: &str = "FRAMEWORK_SHELLS_RUN_ID";
 const FRAMEWORK_SHELLS_FWS_SOCKETIO_URL_KEY: &str = "FRAMEWORK_SHELLS_FWS_SOCKETIO_URL";
 const TE_FRAMEWORK_URL_KEY: &str = "TE_FRAMEWORK_URL";
+static NEXT_GLOBAL_SHELL_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -126,6 +128,7 @@ pub struct FerrousNativeShellRecord {
     pub cwd: Option<PathBuf>,
     pub env: HashMap<String, String>,
     pub env_keys: Vec<String>,
+    pub env_overrides: HashMap<String, String>,
     pub pid: u32,
     pub status: FerrousNativeShellStatus,
     pub exit_code: Option<i32>,
@@ -207,6 +210,17 @@ pub struct FerrousNativePtyConfig {
 }
 
 #[derive(Clone, Debug, Default)]
+pub struct FerrousShellLaunchOverrides {
+    pub env: HashMap<String, String>,
+    pub label: Option<String>,
+    pub spec_id: Option<String>,
+    pub subgroups: Option<Vec<String>>,
+    pub ui: Option<Map<String, Value>>,
+    pub debug: Option<Map<String, Value>>,
+    pub parent_shell_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct FerrousPipeConfig {
     pub command: Vec<String>,
     pub cwd: Option<PathBuf>,
@@ -261,6 +275,14 @@ struct NativeShellEntry {
     input: Option<Arc<Mutex<Box<dyn Write + Send>>>>,
     output: Option<Arc<Mutex<DirectOutput>>>,
     resize: Option<Arc<File>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SpawnRecordMetadata {
+    env_overrides: HashMap<String, String>,
+    ui: Map<String, Value>,
+    debug: Map<String, Value>,
+    parent_shell_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -539,11 +561,34 @@ impl FerrousNativeManager {
         self.spawn_rendered_shellspec_blocking(spec)
     }
 
+    pub fn spawn_shellspec_entry_with_overrides_blocking(
+        &self,
+        document: &Value,
+        entry: &str,
+        input: &ShellspecRenderInput,
+        overrides: FerrousShellLaunchOverrides,
+    ) -> Result<FerrousNativeShellRecord> {
+        let spec = render_shellspec_entry(document, entry, input)?;
+        self.spawn_rendered_shellspec_with_overrides_blocking(spec, overrides)
+    }
+
     pub fn spawn_rendered_shellspec_blocking(
         &self,
         spec: RenderedShellSpec,
     ) -> Result<FerrousNativeShellRecord> {
-        self.spawn_rendered_shellspec_with_log_dir_blocking(spec, None)
+        self.spawn_rendered_shellspec_with_options_blocking(
+            spec,
+            None,
+            FerrousShellLaunchOverrides::default(),
+        )
+    }
+
+    pub fn spawn_rendered_shellspec_with_overrides_blocking(
+        &self,
+        spec: RenderedShellSpec,
+        overrides: FerrousShellLaunchOverrides,
+    ) -> Result<FerrousNativeShellRecord> {
+        self.spawn_rendered_shellspec_with_options_blocking(spec, None, overrides)
     }
 
     pub fn spawn_rendered_shellspec_with_log_dir_blocking(
@@ -551,39 +596,82 @@ impl FerrousNativeManager {
         spec: RenderedShellSpec,
         log_dir: Option<PathBuf>,
     ) -> Result<FerrousNativeShellRecord> {
+        self.spawn_rendered_shellspec_with_options_blocking(
+            spec,
+            log_dir,
+            FerrousShellLaunchOverrides::default(),
+        )
+    }
+
+    fn spawn_rendered_shellspec_with_options_blocking(
+        &self,
+        spec: RenderedShellSpec,
+        log_dir: Option<PathBuf>,
+        overrides: FerrousShellLaunchOverrides,
+    ) -> Result<FerrousNativeShellRecord> {
         if !spec.autostart {
             bail!("shellspec '{}' has autostart=false", spec.id);
         }
+        let label = overrides.label.unwrap_or_else(|| spec.id.clone());
+        let spec_id = overrides.spec_id.unwrap_or_else(|| spec.id.clone());
+        let subgroups = overrides
+            .subgroups
+            .unwrap_or_else(|| spec.subgroups.clone());
+        let mut env = spec.env.clone();
+        env.extend(overrides.env);
+        let mut ui = spec.ui.clone();
+        if let Some(override_ui) = overrides.ui {
+            ui.extend(override_ui);
+        }
+        let mut debug = spec.debug.clone();
+        if let Some(override_debug) = overrides.debug {
+            debug.extend(override_debug);
+        }
+        let metadata = SpawnRecordMetadata {
+            env_overrides: env.clone(),
+            ui,
+            debug,
+            parent_shell_id: overrides.parent_shell_id,
+        };
         let readiness = spec.readiness.clone();
         let record = match spec.backend.as_str() {
-            "proc" => self.spawn_proc_blocking(FerrousNativeProcConfig {
-                command: spec.command,
-                cwd: spec.cwd,
-                env: spec.env,
-                label: spec.id.clone(),
-                spec_id: spec.id,
-                subgroups: spec.subgroups,
-                log_dir: log_dir.clone(),
-            }),
-            "pipe" => self.spawn_pipe_blocking(FerrousNativePipeConfig {
-                command: spec.command,
-                cwd: spec.cwd,
-                env: spec.env,
-                label: spec.id.clone(),
-                spec_id: spec.id,
-                subgroups: spec.subgroups,
-                log_dir: log_dir.clone(),
-            }),
-            "pty" => self.spawn_pty_blocking(FerrousNativePtyConfig {
-                command: spec.command,
-                cwd: spec.cwd,
-                env: spec.env,
-                label: spec.id.clone(),
-                spec_id: spec.id,
-                subgroups: spec.subgroups,
-                log_dir,
-                mode: parse_pty_mode(&spec.pty_mode)?,
-            }),
+            "proc" => self.spawn_proc_with_metadata_blocking(
+                FerrousNativeProcConfig {
+                    command: spec.command,
+                    cwd: spec.cwd,
+                    env,
+                    label,
+                    spec_id,
+                    subgroups,
+                    log_dir: log_dir.clone(),
+                },
+                metadata,
+            ),
+            "pipe" => self.spawn_pipe_with_metadata_blocking(
+                FerrousNativePipeConfig {
+                    command: spec.command,
+                    cwd: spec.cwd,
+                    env,
+                    label,
+                    spec_id,
+                    subgroups,
+                    log_dir: log_dir.clone(),
+                },
+                metadata,
+            ),
+            "pty" => self.spawn_pty_with_metadata_blocking(
+                FerrousNativePtyConfig {
+                    command: spec.command,
+                    cwd: spec.cwd,
+                    env,
+                    label,
+                    spec_id,
+                    subgroups,
+                    log_dir,
+                    mode: parse_pty_mode(&spec.pty_mode)?,
+                },
+                metadata,
+            ),
             backend => bail!("unsupported native shellspec backend '{backend}'"),
         }?;
         if let Some(probe) = readiness {
@@ -642,6 +730,18 @@ impl FerrousNativeManager {
         &self,
         config: FerrousNativeProcConfig,
     ) -> Result<FerrousNativeShellRecord> {
+        let metadata = SpawnRecordMetadata {
+            env_overrides: config.env.clone(),
+            ..SpawnRecordMetadata::default()
+        };
+        self.spawn_proc_with_metadata_blocking(config, metadata)
+    }
+
+    fn spawn_proc_with_metadata_blocking(
+        &self,
+        config: FerrousNativeProcConfig,
+        metadata: SpawnRecordMetadata,
+    ) -> Result<FerrousNativeShellRecord> {
         validate_command(&config.command, "native proc")?;
         let log_dir = self.resolve_log_dir(config.log_dir)?;
         create_dir_all(&log_dir).with_context(|| {
@@ -653,7 +753,7 @@ impl FerrousNativeManager {
         let id = self.next_shell_id()?;
         let stdout_log = log_dir.join(format!("{id}.stdout.log"));
         let stderr_log = log_dir.join(format!("{id}.stderr.log"));
-        let record_path = record_path_for(&log_dir, &id);
+        let record_path = record_path_for(&self.store.metadata_dir, &id);
         let stdout_file = File::create(&stdout_log)
             .with_context(|| format!("failed to create stdout log {}", stdout_log.display()))?;
         let stderr_file = File::create(&stderr_log)
@@ -697,7 +797,7 @@ impl FerrousNativeManager {
         let now = now_ms();
         let io_metadata_log = Some(io_metadata_path_for(&log_dir, &id));
         let app_id = derive_app_id(&config.label, &config.subgroups);
-        let is_app_worker = config.label.starts_with("app-worker:");
+        let is_app_worker = derive_is_app_worker(&config.label, &config.subgroups);
         let record = FerrousNativeShellRecord {
             id: id.clone(),
             backend: "proc".to_owned(),
@@ -705,6 +805,7 @@ impl FerrousNativeManager {
             cwd: config.cwd,
             env_keys: sorted_env_keys(&child_env),
             env: child_env,
+            env_overrides: metadata.env_overrides,
             pid,
             status: FerrousNativeShellStatus::Running,
             exit_code: None,
@@ -717,11 +818,11 @@ impl FerrousNativeManager {
             io_metadata_log,
             pty_mode: None,
             autostart: true,
-            ui: Map::new(),
-            debug: Map::new(),
+            ui: metadata.ui,
+            debug: metadata.debug,
             runtime_id: Some(self.store.runtime_id.clone()),
             app_id,
-            parent_shell_id: None,
+            parent_shell_id: metadata.parent_shell_id,
             is_app_worker,
             capabilities: FerrousNativeShellCapabilities {
                 stdin_write: false,
@@ -757,6 +858,18 @@ impl FerrousNativeManager {
         &self,
         config: FerrousNativePipeConfig,
     ) -> Result<FerrousNativeShellRecord> {
+        let metadata = SpawnRecordMetadata {
+            env_overrides: config.env.clone(),
+            ..SpawnRecordMetadata::default()
+        };
+        self.spawn_pipe_with_metadata_blocking(config, metadata)
+    }
+
+    fn spawn_pipe_with_metadata_blocking(
+        &self,
+        config: FerrousNativePipeConfig,
+        metadata: SpawnRecordMetadata,
+    ) -> Result<FerrousNativeShellRecord> {
         validate_command(&config.command, "native pipe")?;
         let log_dir = self.resolve_log_dir(config.log_dir)?;
         create_dir_all(&log_dir).with_context(|| {
@@ -768,7 +881,7 @@ impl FerrousNativeManager {
         let id = self.next_shell_id()?;
         let stdout_log = log_dir.join(format!("{id}.stdout.log"));
         let stderr_log = log_dir.join(format!("{id}.stderr.log"));
-        let record_path = record_path_for(&log_dir, &id);
+        let record_path = record_path_for(&self.store.metadata_dir, &id);
         let stdout_file = open_log(&stdout_log)?;
         let stderr_file = File::create(&stderr_log)
             .with_context(|| format!("failed to create stderr log {}", stderr_log.display()))?;
@@ -816,7 +929,7 @@ impl FerrousNativeManager {
         let now = now_ms();
         let io_metadata_log = Some(io_metadata_path_for(&log_dir, &id));
         let app_id = derive_app_id(&config.label, &config.subgroups);
-        let is_app_worker = config.label.starts_with("app-worker:");
+        let is_app_worker = derive_is_app_worker(&config.label, &config.subgroups);
         let record = FerrousNativeShellRecord {
             id: id.clone(),
             backend: "pipe".to_owned(),
@@ -824,6 +937,7 @@ impl FerrousNativeManager {
             cwd: config.cwd,
             env_keys: sorted_env_keys(&child_env),
             env: child_env,
+            env_overrides: metadata.env_overrides,
             pid,
             status: FerrousNativeShellStatus::Running,
             exit_code: None,
@@ -836,11 +950,11 @@ impl FerrousNativeManager {
             io_metadata_log,
             pty_mode: None,
             autostart: true,
-            ui: Map::new(),
-            debug: Map::new(),
+            ui: metadata.ui,
+            debug: metadata.debug,
             runtime_id: Some(self.store.runtime_id.clone()),
             app_id,
-            parent_shell_id: None,
+            parent_shell_id: metadata.parent_shell_id,
             is_app_worker,
             capabilities: FerrousNativeShellCapabilities {
                 stdin_write: input.is_some(),
@@ -876,6 +990,18 @@ impl FerrousNativeManager {
         &self,
         config: FerrousNativePtyConfig,
     ) -> Result<FerrousNativeShellRecord> {
+        let metadata = SpawnRecordMetadata {
+            env_overrides: config.env.clone(),
+            ..SpawnRecordMetadata::default()
+        };
+        self.spawn_pty_with_metadata_blocking(config, metadata)
+    }
+
+    fn spawn_pty_with_metadata_blocking(
+        &self,
+        config: FerrousNativePtyConfig,
+        metadata: SpawnRecordMetadata,
+    ) -> Result<FerrousNativeShellRecord> {
         validate_command(&config.command, "native pty")?;
         let log_dir = self.resolve_log_dir(config.log_dir)?;
         create_dir_all(&log_dir).with_context(|| {
@@ -887,7 +1013,7 @@ impl FerrousNativeManager {
         let id = self.next_shell_id()?;
         let stdout_log = log_dir.join(format!("{id}.stdout.log"));
         let stderr_log = log_dir.join(format!("{id}.stderr.log"));
-        let record_path = record_path_for(&log_dir, &id);
+        let record_path = record_path_for(&self.store.metadata_dir, &id);
         let stdout_file = open_log(&stdout_log)?;
         File::create(&stderr_log)
             .with_context(|| format!("failed to create stderr log {}", stderr_log.display()))?;
@@ -930,7 +1056,7 @@ impl FerrousNativeManager {
         let now = now_ms();
         let io_metadata_log = Some(io_metadata_path_for(&log_dir, &id));
         let app_id = derive_app_id(&config.label, &config.subgroups);
-        let is_app_worker = config.label.starts_with("app-worker:");
+        let is_app_worker = derive_is_app_worker(&config.label, &config.subgroups);
         let record = FerrousNativeShellRecord {
             id: id.clone(),
             backend: "pty".to_owned(),
@@ -938,6 +1064,7 @@ impl FerrousNativeManager {
             cwd: config.cwd,
             env_keys: sorted_env_keys(&child_env),
             env: child_env,
+            env_overrides: metadata.env_overrides,
             pid,
             status: FerrousNativeShellStatus::Running,
             exit_code: None,
@@ -950,11 +1077,11 @@ impl FerrousNativeManager {
             io_metadata_log,
             pty_mode: Some(config.mode),
             autostart: true,
-            ui: Map::new(),
-            debug: Map::new(),
+            ui: metadata.ui,
+            debug: metadata.debug,
             runtime_id: Some(self.store.runtime_id.clone()),
             app_id,
-            parent_shell_id: None,
+            parent_shell_id: metadata.parent_shell_id,
             is_app_worker,
             capabilities: FerrousNativeShellCapabilities {
                 stdin_write: true,
@@ -1006,7 +1133,7 @@ impl FerrousNativeManager {
                 return Ok(Some(entry.record.clone()));
             }
         }
-        let record_path = record_path_for(&self.store.logs_dir, shell_id);
+        let record_path = record_path_for(&self.store.metadata_dir, shell_id);
         if record_path.exists() {
             return Ok(Some(load_persisted_record(&record_path)?));
         }
@@ -1040,7 +1167,7 @@ impl FerrousNativeManager {
     }
 
     pub fn list_persisted_records(&self) -> Result<Vec<FerrousNativeShellRecord>> {
-        list_persisted_records_in_dir(&self.store.logs_dir)
+        list_persisted_records_in_dir(&self.store.metadata_dir)
     }
 
     pub fn live_records(&self) -> Result<Vec<FerrousNativeShellRecord>> {
@@ -1458,7 +1585,14 @@ impl FerrousNativeManager {
     fn next_shell_id(&self) -> Result<String> {
         let mut state = self.lock_state()?;
         state.next_id += 1;
-        Ok(format!("frs_{}_{}", now_ms(), state.next_id))
+        let global_id = NEXT_GLOBAL_SHELL_ID.fetch_add(1, Ordering::Relaxed);
+        Ok(format!(
+            "frs_{}_{}_{}_{}",
+            now_ms(),
+            std::process::id(),
+            global_id,
+            state.next_id
+        ))
     }
 
     fn merged_child_env(&self, explicit_env: HashMap<String, String>) -> HashMap<String, String> {
@@ -1727,16 +1861,29 @@ fn spawn_compat_pipe(
                 spec.backend
             );
         }
-        let mut env = config.env;
-        env.extend(spec.env);
-        spec.env = env;
         if spec.cwd.is_none() {
             spec.cwd = config.cwd;
         }
-        if spec.subgroups.is_empty() {
-            spec.subgroups = config.subgroups;
-        }
-        return manager.spawn_rendered_shellspec_with_log_dir_blocking(spec, config.log_dir);
+        let label = nonempty_or(config.label, &spec.id);
+        let spec_id = nonempty_or(config.spec_id, &spec.id);
+        let subgroups = if config.subgroups.is_empty() {
+            None
+        } else {
+            Some(config.subgroups)
+        };
+        return manager.spawn_rendered_shellspec_with_options_blocking(
+            spec,
+            config.log_dir,
+            FerrousShellLaunchOverrides {
+                env: config.env,
+                label: Some(label),
+                spec_id: Some(spec_id),
+                subgroups,
+                ui: None,
+                debug: None,
+                parent_shell_id: None,
+            },
+        );
     }
     manager.spawn_pipe_blocking(FerrousNativePipeConfig {
         command: config.command,
@@ -1906,8 +2053,8 @@ fn file_len(path: &PathBuf) -> u64 {
     metadata(path).map(|meta| meta.len()).unwrap_or_default()
 }
 
-fn record_path_for(log_dir: &std::path::Path, shell_id: &str) -> PathBuf {
-    log_dir.join(format!("{shell_id}.record.json"))
+fn record_path_for(metadata_dir: &std::path::Path, shell_id: &str) -> PathBuf {
+    metadata_dir.join(shell_id).join("meta.json")
 }
 
 fn io_metadata_path_for(log_dir: &std::path::Path, shell_id: &str) -> PathBuf {
@@ -1917,8 +2064,25 @@ fn io_metadata_path_for(log_dir: &std::path::Path, shell_id: &str) -> PathBuf {
 fn derive_app_id(label: &str, subgroups: &[String]) -> Option<String> {
     label
         .strip_prefix("app-worker:")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
         .map(str::to_owned)
-        .or_else(|| subgroups.first().cloned())
+        .or_else(|| {
+            subgroups
+                .first()
+                .map(String::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        })
+}
+
+fn derive_is_app_worker(label: &str, subgroups: &[String]) -> bool {
+    label.starts_with("app-worker:")
+        || subgroups
+            .get(1)
+            .map(String::as_str)
+            .is_some_and(|value| value.trim() == "app-worker")
 }
 
 fn ms_to_seconds(value: u128) -> f64 {
@@ -1965,6 +2129,7 @@ pub fn load_persisted_record(path: impl AsRef<Path>) -> Result<FerrousNativeShel
         cwd: persisted.cwd.map(PathBuf::from),
         env: HashMap::new(),
         env_keys: persisted.env_keys,
+        env_overrides: json_object_to_string_map(persisted.env_overrides),
         pid: persisted.pid,
         status: persisted.status,
         exit_code: persisted.exit_code,
@@ -1990,29 +2155,25 @@ pub fn load_persisted_record(path: impl AsRef<Path>) -> Result<FerrousNativeShel
     })
 }
 
-fn list_persisted_records_in_dir(logs_dir: &Path) -> Result<Vec<FerrousNativeShellRecord>> {
-    if !logs_dir.exists() {
+fn list_persisted_records_in_dir(metadata_dir: &Path) -> Result<Vec<FerrousNativeShellRecord>> {
+    if !metadata_dir.exists() {
         return Ok(Vec::new());
     }
     let mut records = Vec::new();
-    for entry in read_dir(logs_dir)
-        .with_context(|| format!("failed to read native record dir {}", logs_dir.display()))?
-    {
+    for entry in read_dir(metadata_dir).with_context(|| {
+        format!(
+            "failed to read native metadata dir {}",
+            metadata_dir.display()
+        )
+    })? {
         let entry = entry.with_context(|| {
             format!(
-                "failed to read native record dir entry {}",
-                logs_dir.display()
+                "failed to read native metadata dir entry {}",
+                metadata_dir.display()
             )
         })?;
-        let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("json") {
-            continue;
-        }
-        if !path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .is_some_and(|name| name.ends_with(".record.json"))
-        {
+        let path = entry.path().join("meta.json");
+        if !path.is_file() {
             continue;
         }
         records.push(load_persisted_record(path)?);
@@ -2022,6 +2183,10 @@ fn list_persisted_records_in_dir(logs_dir: &Path) -> Result<Vec<FerrousNativeShe
 }
 
 fn persist_record(record: &FerrousNativeShellRecord, path: &std::path::Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        create_dir_all(parent)
+            .with_context(|| format!("failed to create record dir {}", parent.display()))?;
+    }
     let persisted = PersistedNativeShellRecord {
         id: record.id.clone(),
         spec_id: record.spec_id.clone(),
@@ -2048,7 +2213,7 @@ fn persist_record(record: &FerrousNativeShellRecord, path: &std::path::Path) -> 
         run_id: record.env.get("FRAMEWORK_SHELLS_RUN_ID").cloned(),
         launcher_pid: std::process::id(),
         env_keys: record.env_keys.clone(),
-        env_overrides: Map::new(),
+        env_overrides: string_map_to_json_object(&record.env_overrides),
         uses_pty: record.backend == "pty",
         uses_pipes: record.backend == "pipe",
         uses_dtach: false,
@@ -2082,6 +2247,26 @@ fn sorted_env_keys(env: &HashMap<String, String>) -> Vec<String> {
     let mut keys = env.keys().cloned().collect::<Vec<_>>();
     keys.sort();
     keys
+}
+
+fn string_map_to_json_object(values: &HashMap<String, String>) -> Map<String, Value> {
+    values
+        .iter()
+        .map(|(key, value)| (key.clone(), Value::String(value.clone())))
+        .collect()
+}
+
+fn json_object_to_string_map(values: Map<String, Value>) -> HashMap<String, String> {
+    values
+        .into_iter()
+        .filter_map(|(key, value)| match value {
+            Value::String(value) => Some((key, value)),
+            Value::Number(value) => Some((key, value.to_string())),
+            Value::Bool(value) => Some((key, value.to_string())),
+            Value::Null => Some((key, String::new())),
+            Value::Array(_) | Value::Object(_) => None,
+        })
+        .collect()
 }
 
 fn set_nonblocking(fd: &impl AsFd) -> Result<()> {

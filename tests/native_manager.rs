@@ -1,7 +1,7 @@
 use ferrous_framework::{
     FerrousFrameworkPipe, FerrousNativeEnv, FerrousNativeManager, FerrousNativeOutputStream,
     FerrousNativePipeConfig, FerrousNativeProcConfig, FerrousNativePtyConfig, FerrousNativePtyMode,
-    FerrousNativeShellStatus, FerrousNativeStore, FerrousPipeConfig,
+    FerrousNativeShellStatus, FerrousNativeStore, FerrousPipeConfig, FerrousShellLaunchOverrides,
     shellspec::ShellspecRenderInput,
 };
 use serde_json::{Value, json};
@@ -336,7 +336,7 @@ fn async_manager_facade_matches_python_fws_pipe_shape() {
 }
 
 #[test]
-fn native_record_sidecar_is_persisted_without_env_values() {
+fn native_record_meta_is_persisted_with_fws_shape() {
     let manager = test_manager_with_native_env("record-sidecar-store", test_native_env());
     let log_dir = test_log_dir("record-sidecar");
     let mut config = base_proc_config(
@@ -392,11 +392,13 @@ fn native_record_sidecar_is_persisted_without_env_values() {
     );
     assert!(initial.get("ui").and_then(Value::as_object).is_some());
     assert!(initial.get("debug").and_then(Value::as_object).is_some());
-    assert!(
+    assert_eq!(
         initial
             .get("env_overrides")
             .and_then(Value::as_object)
-            .is_some_and(serde_json::Map::is_empty)
+            .and_then(|env| env.get("VISIBLE_KEY"))
+            .and_then(Value::as_str),
+        Some("sensitive-value")
     );
     assert!(
         initial
@@ -425,8 +427,12 @@ fn native_record_sidecar_is_persisted_without_env_values() {
             .iter()
             .any(|key| key.as_str() == Some("VISIBLE_KEY"))
     );
-    assert!(!initial.to_string().contains("sensitive-value"));
     assert!(!initial.to_string().contains("secret-from-manager"));
+    assert!(
+        record
+            .record_path
+            .starts_with(&manager.store().metadata_dir)
+    );
 
     let exited = manager
         .wait_shell_blocking(&record.id, Duration::from_secs(3))
@@ -471,7 +477,7 @@ fn omitted_log_dir_uses_fws_runtime_store_logs_dir() {
     config.log_dir = None;
     let record = manager.spawn_proc_blocking(config).expect("spawn proc");
 
-    assert!(record.record_path.starts_with(&store.logs_dir));
+    assert!(record.record_path.starts_with(&store.metadata_dir));
     assert!(record.stdout_log.starts_with(&store.logs_dir));
     assert!(record.stderr_log.starts_with(&store.logs_dir));
 
@@ -529,6 +535,155 @@ fn shellspec_entry_launches_native_pipe_with_rendered_ctx_and_env() {
         .expect("read line")
         .expect("line");
     assert_eq!(line, "native-shellspec:ping");
+    assert!(
+        manager
+            .terminate_shell_blocking(&record.id)
+            .expect("terminate shell")
+    );
+}
+
+#[test]
+fn shellspec_app_worker_launch_persists_python_fws_metadata_shape() {
+    let manager = test_manager_with_store("shellspec-app-worker-metadata");
+    let app_id = "file_editor_cm6";
+    let document = json!({
+        "version": "1",
+        "shells": {
+            "app-worker": {
+                "backend": "proc",
+                "command": ["sh", "-c", "printf app-worker-ready; sleep 30"],
+                "env": {
+                    "TE_APP_ID": "${ctx:APP_ID}",
+                    "TE_APP_WORKER_PORT": "${free_port}"
+                },
+                "subgroups": ["${ctx:APP_ID}", "app-worker"],
+                "ui": {
+                    "subgroup_styles": {
+                        "app-worker": { "bg": "blue" }
+                    }
+                },
+                "debug": {
+                    "io_metadata": true
+                }
+            }
+        }
+    });
+    let input = ShellspecRenderInput {
+        ctx: HashMap::from([("APP_ID".to_owned(), app_id.to_owned())]),
+        env: HashMap::new(),
+    };
+    let record = manager
+        .spawn_shellspec_entry_with_overrides_blocking(
+            &document,
+            "app-worker",
+            &input,
+            FerrousShellLaunchOverrides {
+                env: HashMap::from([(
+                    "TE_FRAMEWORK_URL".to_owned(),
+                    "http://127.0.0.1:8089".to_owned(),
+                )]),
+                label: Some(format!("app-worker:{app_id}")),
+                spec_id: Some(format!("app:{app_id}:app-worker")),
+                subgroups: Some(vec![app_id.to_owned(), "app-worker".to_owned()]),
+                ui: Some(
+                    json!({
+                        "card": "from-app-manifest"
+                    })
+                    .as_object()
+                    .expect("ui object")
+                    .clone(),
+                ),
+                debug: None,
+                parent_shell_id: None,
+            },
+        )
+        .expect("spawn app worker shellspec");
+
+    assert_eq!(record.label, "app-worker:file_editor_cm6");
+    assert_eq!(record.spec_id, "app:file_editor_cm6:app-worker");
+    assert_eq!(record.subgroups, vec!["file_editor_cm6", "app-worker"]);
+    assert_eq!(record.app_id.as_deref(), Some(app_id));
+    assert!(record.is_app_worker);
+    assert_eq!(
+        record
+            .env_overrides
+            .get("TE_FRAMEWORK_URL")
+            .map(String::as_str),
+        Some("http://127.0.0.1:8089")
+    );
+    assert!(record.env_overrides.contains_key("TE_APP_WORKER_PORT"));
+    assert!(
+        record
+            .record_path
+            .starts_with(&manager.store().metadata_dir)
+    );
+    assert_eq!(
+        record.record_path,
+        manager
+            .store()
+            .metadata_dir
+            .join(&record.id)
+            .join("meta.json")
+    );
+
+    let persisted: Value = serde_json::from_str(&eventually_read_to_string(
+        &record.record_path,
+        Duration::from_secs(3),
+    ))
+    .expect("persisted app worker record");
+    assert_eq!(
+        persisted.get("label").and_then(Value::as_str),
+        Some("app-worker:file_editor_cm6")
+    );
+    assert_eq!(
+        persisted.get("spec_id").and_then(Value::as_str),
+        Some("app:file_editor_cm6:app-worker")
+    );
+    assert_eq!(
+        persisted.get("is_app_worker").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        persisted.get("app_id").and_then(Value::as_str),
+        Some(app_id)
+    );
+    assert_eq!(
+        persisted
+            .get("subgroups")
+            .and_then(Value::as_array)
+            .and_then(|values| values.get(1))
+            .and_then(Value::as_str),
+        Some("app-worker")
+    );
+    assert!(
+        persisted
+            .get("env_overrides")
+            .and_then(Value::as_object)
+            .is_some_and(|env| env.contains_key("TE_APP_WORKER_PORT"))
+    );
+    assert_eq!(
+        persisted
+            .get("env_overrides")
+            .and_then(Value::as_object)
+            .and_then(|env| env.get("TE_FRAMEWORK_URL"))
+            .and_then(Value::as_str),
+        Some("http://127.0.0.1:8089")
+    );
+    assert!(
+        persisted
+            .get("ui")
+            .and_then(Value::as_object)
+            .is_some_and(|ui| ui.contains_key("subgroup_styles") && ui.contains_key("card"))
+    );
+    assert_eq!(
+        persisted
+            .get("debug")
+            .and_then(Value::as_object)
+            .and_then(|debug| debug.get("io_metadata"))
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+
     assert!(
         manager
             .terminate_shell_blocking(&record.id)

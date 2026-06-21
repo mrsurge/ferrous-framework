@@ -155,6 +155,7 @@ struct ShellPayload {
     created_at_ms: u128,
     updated_at_ms: u128,
     env_keys: Vec<String>,
+    env_overrides: HashMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1555,6 +1556,7 @@ fn shell_payload(record: FerrousNativeShellRecord) -> ShellPayload {
         created_at_ms: record.created_at_ms,
         updated_at_ms: record.updated_at_ms,
         env_keys: record.env_keys,
+        env_overrides: record.env_overrides,
     }
 }
 

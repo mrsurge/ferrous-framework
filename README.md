@@ -41,6 +41,7 @@ Current native API:
 - `ferrous_native_enabled`
 - `shellspec::render_shellspec_entry`
 - `FerrousNativeManager::spawn_shellspec_entry_blocking`
+- `FerrousNativeManager::spawn_shellspec_entry_with_overrides_blocking`
 - `FerrousNativeManager::shutdown_tree_blocking`
 - `FerrousNativeManager::shutdown_all_blocking`
 
@@ -82,11 +83,11 @@ For ALS-style pipe consumers, `FerrousFrameworkPipe::spawn(FerrousPipeConfig { .
 
 `pyo3_embed_enabled()` is retained as a legacy availability gate for older callers. In the native crate it reports the compatibility surface is available; it does not mean Python is in the runtime path. `ferrous_native_enabled()` is the literal native runtime capability flag.
 
-`FerrousNativeManager::new()` uses the same store layout as Python FWS: `FRAMEWORK_SHELLS_BASE_DIR` or `~/.cache/framework_shells`, `runtimes/<repo_fingerprint>/<runtime_id>/logs`, where `runtime_id` is `sha256(secret)[:16]`. If a spawn config leaves `log_dir` as `None`, logs and sidecar records are written into that canonical FWS logs directory. `Some(path)` remains an explicit override.
+`FerrousNativeManager::new()` uses the same store layout as Python FWS: `FRAMEWORK_SHELLS_BASE_DIR` or `~/.cache/framework_shells`, `runtimes/<repo_fingerprint>/<runtime_id>/meta`, `logs`, and `sockets`, where `runtime_id` is `sha256(secret)[:16]`. If a spawn config leaves `log_dir` as `None`, logs are written into the canonical FWS logs directory. `Some(path)` remains an explicit log override; metadata still goes to the canonical FWS metadata directory.
 
-Each native launch writes a sidecar record at `FerrousNativeShellRecord.record_path`, next to the stdout/stderr logs. The sidecar records command/backend/status/log paths/capabilities/run metadata and env keys, but does not persist env values or secrets. The JSON includes FWS-compatible fields such as `created_at`, `updated_at`, `autostart`, `ui`, `debug`, `io_metadata_log`, backend flags, `runtime_id`, and derived app metadata. `io_metadata_log` is currently a stable sidecar path, not proof that Ferrous is writing IO metadata records yet.
+Each native launch writes a Python-FWS-shaped metadata record at `meta/<shell_id>/meta.json`, exposed as `FerrousNativeShellRecord.record_path`. The record includes command/backend/status/log paths/capabilities/run metadata, labels, subgroups, UI/debug metadata, explicit launch `env_overrides`, env keys, backend flags, `runtime_id`, and derived app metadata. Manager-owned FWS secrets inherited through the native environment overlay are not written into `env_overrides` unless a caller explicitly passes them as a shell override. `io_metadata_log` is currently a stable sidecar path, not proof that Ferrous is writing IO metadata records yet.
 
-Fresh managers can load sidecar records from the canonical store logs directory. Loaded records are marked `adopted: true`, keep log/capability metadata for inspection, and deliberately clear live-only controls such as `stdin_write` and `terminate`.
+Fresh managers can load metadata records from the canonical store metadata directory. Loaded records are marked `adopted: true`, keep log/capability metadata for inspection, and deliberately clear live-only controls such as `stdin_write` and `terminate`.
 
 Capability records distinguish logs, live output reads, output subscriptions, stdin write, stdin EOF, terminate, and resize explicitly. PTY shells expose `resize_pty_blocking(...)` through the native manager. Adopted/stale records clear live-only controls even if the persisted record was created by a live owner.
 
@@ -182,7 +183,9 @@ cargo test
 
 The current fixture set covers `proc`, `pipe`, and `pty` render surfaces, ctx/env precedence, missing values, and stable free-port substitution.
 
-Ferrous can also launch a rendered shellspec entry directly through `FerrousNativeManager::spawn_shellspec_entry_blocking(...)`. The API renders the selected entry, parses command/env/subgroups/backend, and dispatches to native `proc`, `pipe`, or `pty`. Shellspec `command` may be a string array or a shell-style command string. Direct launch waits for supported readiness probes (`tcp_port`, `stdout_regex`) and rejects unsupported probe types explicitly.
+Ferrous can also launch a rendered shellspec entry directly through `FerrousNativeManager::spawn_shellspec_entry_blocking(...)`. The API renders the selected entry, parses command/env/subgroups/backend/UI/debug metadata, and dispatches to native `proc`, `pipe`, or `pty`. Shellspec `command` may be a string array or a shell-style command string. Direct launch waits for supported readiness probes (`tcp_port`, `stdout_regex`) and rejects unsupported probe types explicitly.
+
+For app-framework callers that need Python FWS app-worker metadata, use `spawn_shellspec_entry_with_overrides_blocking(...)` with `FerrousShellLaunchOverrides`. That explicit override surface carries `label`, `spec_id`, `subgroups`, UI/debug metadata, parent shell id, and caller env. TE2-style app workers should pass `label = app-worker:<app_id>`, `spec_id = app:<app_id>:<entry>`, and `subgroups = [app_id, "app-worker"]` so existing FWS discovery consumers can detect the app launch from metadata alone.
 
 For multi-entry shellspec documents, `FerrousNativeManager::apply_shellspec_document_blocking(...)` starts missing `autostart` specs, skips live running specs with the same `spec_id`, and can prune live specs that are no longer present in the desired document.
 
