@@ -112,7 +112,7 @@ fn test_manager_with_native_env(name: &str, env: FerrousNativeEnv) -> FerrousNat
 
 #[test]
 fn spawns_proc_and_captures_stdout_stderr_logs() {
-    let manager = FerrousNativeManager::new();
+    let manager = test_manager_with_store("captures-logs-store");
     let log_dir = test_log_dir("captures-logs");
     let record = manager
         .spawn_proc_blocking(base_proc_config(
@@ -861,6 +861,85 @@ fn terminates_running_proc() {
         .expect("shell record");
     assert_eq!(exited.status, FerrousNativeShellStatus::Exited);
     assert_ne!(exited.exit_code, Some(0));
+}
+
+#[test]
+fn shutdown_tree_with_empty_roots_terminates_all_live_roots() {
+    let manager = FerrousNativeManager::new();
+    let first = manager
+        .spawn_proc_blocking(base_proc_config(
+            vec!["sh".to_owned(), "-c".to_owned(), "sleep 30".to_owned()],
+            test_log_dir("shutdown-tree-all-first"),
+        ))
+        .expect("spawn first proc");
+    let second = manager
+        .spawn_proc_blocking(base_proc_config(
+            vec!["sh".to_owned(), "-c".to_owned(), "sleep 30".to_owned()],
+            test_log_dir("shutdown-tree-all-second"),
+        ))
+        .expect("spawn second proc");
+
+    let result = manager
+        .shutdown_tree_blocking(Vec::new())
+        .expect("shutdown all roots through tree hook");
+    assert!(result.ok, "shutdown errors: {:?}", result.stats.errors);
+    assert_eq!(result.kind, "shutdown_tree");
+    assert_eq!(result.target, "all");
+    assert!(result.root_pids.is_empty());
+    assert_eq!(result.stats.total, 2);
+    assert_eq!(result.stats.terminated, 2);
+
+    for shell_id in [&first.id, &second.id] {
+        let exited = manager
+            .wait_shell_blocking(shell_id, Duration::from_secs(3))
+            .expect("wait shell")
+            .expect("shell record");
+        assert_eq!(exited.status, FerrousNativeShellStatus::Exited);
+    }
+}
+
+#[test]
+fn shutdown_tree_with_roots_only_terminates_matching_live_roots() {
+    let manager = FerrousNativeManager::new();
+    let selected = manager
+        .spawn_proc_blocking(base_proc_config(
+            vec!["sh".to_owned(), "-c".to_owned(), "sleep 30".to_owned()],
+            test_log_dir("shutdown-tree-selected"),
+        ))
+        .expect("spawn selected proc");
+    let untouched = manager
+        .spawn_proc_blocking(base_proc_config(
+            vec!["sh".to_owned(), "-c".to_owned(), "sleep 30".to_owned()],
+            test_log_dir("shutdown-tree-untouched"),
+        ))
+        .expect("spawn untouched proc");
+
+    let result = manager
+        .shutdown_tree_blocking(vec![i64::from(selected.pid)])
+        .expect("shutdown selected root");
+    assert!(result.ok, "shutdown errors: {:?}", result.stats.errors);
+    assert_eq!(result.kind, "shutdown_tree");
+    assert_eq!(result.target, selected.pid.to_string());
+    assert_eq!(result.root_pids, vec![i64::from(selected.pid)]);
+    assert_eq!(result.stats.total, 1);
+    assert_eq!(result.stats.terminated, 1);
+
+    let selected_exited = manager
+        .wait_shell_blocking(&selected.id, Duration::from_secs(3))
+        .expect("wait selected")
+        .expect("selected shell record");
+    assert_eq!(selected_exited.status, FerrousNativeShellStatus::Exited);
+
+    let untouched_record = manager
+        .get_shell(&untouched.id)
+        .expect("get untouched")
+        .expect("untouched record");
+    assert_eq!(untouched_record.status, FerrousNativeShellStatus::Running);
+    assert!(
+        manager
+            .terminate_shell_blocking(&untouched.id)
+            .expect("terminate untouched")
+    );
 }
 
 #[test]

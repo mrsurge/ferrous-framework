@@ -1288,6 +1288,65 @@ impl FerrousNativeManager {
             .iter()
             .map(|record| i64::from(record.pid))
             .collect::<Vec<_>>();
+        self.shutdown_records_blocking(
+            "shutdown_group",
+            app_id,
+            root_pids,
+            targets,
+            "Ferrous MVP group shutdown terminates Ferrous-owned live shell roots only",
+            started_at_ms,
+        )
+    }
+
+    pub fn shutdown_tree_blocking(&self, root_pids: Vec<i64>) -> Result<FerrousShutdownResult> {
+        let started_at_ms = now_ms() as u64;
+        let target_filter = root_pids.iter().copied().collect::<HashSet<_>>();
+        let targets = self
+            .live_records()?
+            .into_iter()
+            .filter(|record| record.status == FerrousNativeShellStatus::Running)
+            .filter(|record| {
+                target_filter.is_empty() || target_filter.contains(&i64::from(record.pid))
+            })
+            .collect::<Vec<_>>();
+        let target = if root_pids.is_empty() {
+            "all".to_owned()
+        } else {
+            root_pids
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        self.shutdown_records_blocking(
+            "shutdown_tree",
+            &target,
+            root_pids,
+            targets,
+            "Ferrous MVP tree shutdown terminates Ferrous-owned live shell roots only",
+            started_at_ms,
+        )
+    }
+
+    pub fn shutdown_all_blocking(&self) -> Result<FerrousShutdownResult> {
+        let mut result = self.shutdown_tree_blocking(Vec::new())?;
+        result.kind = "shutdown_all".to_owned();
+        result.target = "all".to_owned();
+        result.note = Some(
+            "Ferrous MVP all shutdown terminates Ferrous-owned live shell roots only".to_owned(),
+        );
+        Ok(result)
+    }
+
+    fn shutdown_records_blocking(
+        &self,
+        kind: &str,
+        target: &str,
+        root_pids: Vec<i64>,
+        targets: Vec<FerrousNativeShellRecord>,
+        note: &str,
+        started_at_ms: u64,
+    ) -> Result<FerrousShutdownResult> {
         let mut stats = FerrousShutdownStats {
             total: targets.len() as u64,
             ..FerrousShutdownStats::default()
@@ -1325,18 +1384,15 @@ impl FerrousNativeManager {
         let ended_at_ms = now_ms() as u64;
         Ok(FerrousShutdownResult {
             ok: stats.errors.is_empty(),
-            kind: "shutdown_group".to_owned(),
-            target: app_id.to_owned(),
+            kind: kind.to_owned(),
+            target: target.to_owned(),
             started_at_ms,
             ended_at_ms,
             elapsed_ms: ended_at_ms.saturating_sub(started_at_ms),
             root_pids,
             stats,
             events,
-            note: Some(
-                "Ferrous MVP group shutdown terminates Ferrous-owned live shell roots only"
-                    .to_owned(),
-            ),
+            note: Some(note.to_owned()),
         })
     }
 

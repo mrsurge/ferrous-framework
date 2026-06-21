@@ -63,6 +63,24 @@ fn native_host_serves_control_plane_and_shell_io() {
     assert_eq!(status, 200);
     assert_eq!(json_body(&body)["data"]["backend"], "ferrous-native");
 
+    let (status, _body) = request(addr, "GET", "/fws", &[], "");
+    assert_eq!(status, 308);
+
+    let (status, body) = request(addr, "GET", "/fws/", &[], "");
+    assert_eq!(status, 200);
+    assert!(body.contains("Framework Shells"));
+    assert!(body.contains("/fws/static/fws.css"));
+    assert!(body.contains("/fws/static/fws.js"));
+
+    let (status, body) = request(addr, "GET", "/fws/static/fws.js", &[], "");
+    assert_eq!(status, 200);
+    assert!(body.contains("fws.dashboard.open"));
+    assert!(body.contains("/fws_ws/socket.io"));
+
+    let (status, body) = request(addr, "GET", "/static/vendor/socket.io.min.js", &[], "");
+    assert_eq!(status, 200);
+    assert!(body.contains("socket.io"));
+
     let (status, body) = request(addr, "GET", "/api/framework_shells/runtime", &[], "");
     assert_eq!(status, 200);
     let runtime = json_body(&body);
@@ -142,6 +160,48 @@ fn native_host_serves_control_plane_and_shell_io() {
     assert_eq!(shutdown["data"]["kind"], "shutdown_group");
     assert_eq!(shutdown["data"]["stats"]["total"], 1);
     assert_eq!(shutdown["data"]["stats"]["force_killed"], 1);
+
+    host.close_blocking().expect("close host");
+}
+
+#[test]
+fn native_host_exposes_framework_shutdown_route() {
+    let manager = test_manager("shutdown-route");
+    let token = derive_native_api_token(&manager.native_env().secret);
+    let host = FerrousNativeHost::spawn_with_manager(FerrousNativeHostConfig::default(), manager)
+        .expect("spawn native host");
+    let addr = host.addr();
+
+    let create = json!({
+        "backend": "proc",
+        "command": ["sh", "-c", "sleep 30"],
+        "label": "shutdown-route-proc",
+        "spec_id": "shutdown-route-proc",
+        "subgroups": ["shutdown-route-tests"]
+    })
+    .to_string();
+    let (status, body) = request(
+        addr,
+        "POST",
+        "/api/framework_shells",
+        &[("X-Framework-Key", token.as_str())],
+        &create,
+    );
+    assert_eq!(status, 200, "body: {body}");
+
+    let (status, body) = request(
+        addr,
+        "POST",
+        "/api/framework_shells/shutdown",
+        &[("X-Framework-Key", token.as_str())],
+        &json!({"scope": "all"}).to_string(),
+    );
+    assert_eq!(status, 200, "body: {body}");
+    let shutdown = json_body(&body);
+    assert_eq!(shutdown["data"]["kind"], "shutdown_all");
+    assert_eq!(shutdown["data"]["target"], "all");
+    assert_eq!(shutdown["data"]["stats"]["total"], 1);
+    assert_eq!(shutdown["data"]["stats"]["terminated"], 1);
 
     host.close_blocking().expect("close host");
 }

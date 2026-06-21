@@ -14,9 +14,10 @@ use crate::shellspec::ShellspecRenderInput;
 use anyhow::{Context, Result, anyhow};
 use axum::{
     Json, Router,
+    body::Body,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
-    response::{Html, IntoResponse, Response},
+    response::{IntoResponse, Redirect, Response},
     routing::{get, post},
 };
 use futures_util::StreamExt;
@@ -30,7 +31,7 @@ use socketioxide::{
 };
 use std::{
     collections::{HashMap, HashSet},
-    fs::File,
+    fs::{File, OpenOptions, remove_file},
     io::{Read, Seek, SeekFrom},
     net::{SocketAddr, TcpListener, ToSocketAddrs},
     path::{Path as FsPath, PathBuf},
@@ -192,6 +193,14 @@ struct ShellActionRequest {
     action: String,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct ShutdownRequest {
+    #[serde(default)]
+    root_pids: Vec<i64>,
+    #[serde(default)]
+    scope: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct ShellspecApplyRequest {
     document: Value,
@@ -285,6 +294,17 @@ impl FerrousNativeHost {
         env
     }
 
+    pub fn shutdown_tree_blocking(
+        &self,
+        root_pids: Vec<i64>,
+    ) -> Result<crate::shutdown::FerrousShutdownResult> {
+        self.manager.shutdown_tree_blocking(root_pids)
+    }
+
+    pub fn shutdown_all_blocking(&self) -> Result<crate::shutdown::FerrousShutdownResult> {
+        self.manager.shutdown_all_blocking()
+    }
+
     pub fn close_blocking(mut self) -> Result<()> {
         self.shutdown()
     }
@@ -374,8 +394,11 @@ fn run_host_thread(
 fn router(state: HostState) -> Router {
     Router::new()
         .route("/health", get(health))
-        .route("/fws", get(dashboard))
-        .route("/fws/", get(dashboard))
+        .route("/fws", get(dashboard_root))
+        .route("/fws/", get(dashboard_index))
+        .route("/fws/logs/{shell_id}", get(legacy_logs_page))
+        .route("/fws/static/{path:path}", get(fws_static))
+        .route("/static/vendor/socket.io.min.js", get(socketio_client_js))
         .route("/api/framework_shells/runtime", get(runtime_info))
         .route("/api/framework_shells", get(list_shells).post(create_shell))
         .route(
@@ -396,6 +419,7 @@ fn router(state: HostState) -> Router {
             "/api/framework_shells/app/{app_id}/shutdown",
             post(shutdown_app_group),
         )
+        .route("/api/framework_shells/shutdown", post(shutdown_tree))
         .route("/api/framework_shells/logs/{shell_id}/tail", get(log_tail))
         .with_state(state)
 }
@@ -649,6 +673,154 @@ async fn handle_browser_request(socket: SocketRef, request: Value, state: HostSt
                 }
             }
             json!({"jsonrpc": "2.0", "id": request_id, "result": {"ok": true}})
+        }
+        "fws.logs.truncate" => match truncate_all_logs(&state) {
+            Ok(()) => json!({"jsonrpc": "2.0", "id": request_id, "result": {"ok": true}}),
+            Err(error) => jsonrpc_error(
+                request_id,
+                -32000,
+                &error.to_string(),
+                "action_failed",
+                None,
+            ),
+        },
+        "fws.exited.purge" => match purge_exited_records(&state) {
+            Ok(()) => json!({"jsonrpc": "2.0", "id": request_id, "result": {"ok": true}}),
+            Err(error) => jsonrpc_error(
+                request_id,
+                -32000,
+                &error.to_string(),
+                "action_failed",
+                None,
+            ),
+        },
+        "fws.shell.terminate" => {
+            let Some(shell_id) = params
+                .and_then(|params| params.get("shell_id"))
+                .and_then(Value::as_str)
+            else {
+                return jsonrpc_error(
+                    request_id,
+                    -32602,
+                    "shell_id is required",
+                    "invalid_params",
+                    None,
+                );
+            };
+            match state.manager.terminate_shell_blocking(shell_id) {
+                Ok(true) => json!({"jsonrpc": "2.0", "id": request_id, "result": {"ok": true}}),
+                Ok(false) => jsonrpc_error(
+                    request_id,
+                    -32004,
+                    "Shell not found",
+                    "not_found",
+                    Some(shell_id),
+                ),
+                Err(error) => jsonrpc_error(
+                    request_id,
+                    -32000,
+                    &error.to_string(),
+                    "action_failed",
+                    Some(shell_id),
+                ),
+            }
+        }
+        "fws.shell.purge" => {
+            let Some(shell_id) = params
+                .and_then(|params| params.get("shell_id"))
+                .and_then(Value::as_str)
+            else {
+                return jsonrpc_error(
+                    request_id,
+                    -32602,
+                    "shell_id is required",
+                    "invalid_params",
+                    None,
+                );
+            };
+            match purge_shell_record(&state, shell_id) {
+                Ok(()) => json!({"jsonrpc": "2.0", "id": request_id, "result": {"ok": true}}),
+                Err(error) => jsonrpc_error(
+                    request_id,
+                    -32000,
+                    &error.to_string(),
+                    "action_failed",
+                    Some(shell_id),
+                ),
+            }
+        }
+        "fws.pid.terminate" => {
+            let Some(pid) = params
+                .and_then(|params| params.get("pid"))
+                .and_then(Value::as_i64)
+            else {
+                return jsonrpc_error(
+                    request_id,
+                    -32602,
+                    "pid is required",
+                    "invalid_params",
+                    None,
+                );
+            };
+            match terminate_pid(pid) {
+                Ok(()) => json!({"jsonrpc": "2.0", "id": request_id, "result": {"ok": true}}),
+                Err(error) => jsonrpc_error(
+                    request_id,
+                    -32000,
+                    &error.to_string(),
+                    "action_failed",
+                    None,
+                ),
+            }
+        }
+        "fws.app.shutdown" => {
+            let Some(app_id) = params
+                .and_then(|params| params.get("app_id"))
+                .and_then(Value::as_str)
+            else {
+                return jsonrpc_error(
+                    request_id,
+                    -32602,
+                    "app_id is required",
+                    "invalid_params",
+                    None,
+                );
+            };
+            match state.manager.shutdown_app_group_blocking(app_id) {
+                Ok(shutdown) => {
+                    json!({"jsonrpc": "2.0", "id": request_id, "result": {"ok": true, "shutdown": shutdown}})
+                }
+                Err(error) => jsonrpc_error(
+                    request_id,
+                    -32000,
+                    &error.to_string(),
+                    "action_failed",
+                    None,
+                ),
+            }
+        }
+        "fws.shutdown" => {
+            let scope = params
+                .and_then(|params| params.get("scope"))
+                .and_then(Value::as_str)
+                .unwrap_or("tree");
+            let result = match scope {
+                "shells" | "all" => state.manager.shutdown_all_blocking(),
+                "tree" => state.manager.shutdown_tree_blocking(Vec::new()),
+                _ => Err(anyhow!("Unknown shutdown scope: {scope}")),
+            };
+            match result {
+                Ok(shutdown) => {
+                    json!({"jsonrpc": "2.0", "id": request_id, "result": {"ok": true, "shutdown": shutdown}})
+                }
+                Err(error) => jsonrpc_error(
+                    request_id,
+                    -32000,
+                    &error.to_string(),
+                    "action_failed",
+                    None,
+                ),
+            }
         }
         FWS_SHELL_INPUT_METHOD => {
             let Some(params) = params else {
@@ -918,6 +1090,74 @@ async fn broadcast_peer_subscriptions(state: &HostState) {
         .await;
 }
 
+fn truncate_all_logs(state: &HostState) -> Result<()> {
+    for record in state.manager.list_shells()? {
+        truncate_log_file(&record.stdout_log)?;
+        truncate_log_file(&record.stderr_log)?;
+    }
+    Ok(())
+}
+
+fn truncate_log_file(path: &PathBuf) -> Result<()> {
+    OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .with_context(|| format!("failed to truncate log {}", path.display()))?;
+    Ok(())
+}
+
+fn purge_exited_records(state: &HostState) -> Result<()> {
+    for record in state.manager.list_shells()? {
+        if record.status == FerrousNativeShellStatus::Exited {
+            purge_record_files(&record)?;
+        }
+    }
+    Ok(())
+}
+
+fn purge_shell_record(state: &HostState, shell_id: &str) -> Result<()> {
+    let Some(record) = state.manager.get_shell(shell_id)? else {
+        return Err(anyhow!("Shell not found: {shell_id}"));
+    };
+    if record.status == FerrousNativeShellStatus::Running {
+        return Err(anyhow!("Refusing to purge running shell: {shell_id}"));
+    }
+    purge_record_files(&record)
+}
+
+fn purge_record_files(record: &FerrousNativeShellRecord) -> Result<()> {
+    remove_file_if_exists(&record.stdout_log)?;
+    remove_file_if_exists(&record.stderr_log)?;
+    if let Some(path) = &record.io_metadata_log {
+        remove_file_if_exists(path)?;
+    }
+    remove_file_if_exists(&record.record_path)?;
+    Ok(())
+}
+
+fn remove_file_if_exists(path: &PathBuf) -> Result<()> {
+    match remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("failed to remove {}", path.display())),
+    }
+}
+
+fn terminate_pid(pid: i64) -> Result<()> {
+    if pid <= 0 || pid > i64::from(i32::MAX) {
+        return Err(anyhow!("invalid pid: {pid}"));
+    }
+    let rc = unsafe { nix::libc::kill(pid as nix::libc::pid_t, nix::libc::SIGTERM) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+            .with_context(|| format!("failed to terminate pid {pid}"))
+    }
+}
+
 fn read_log_text_lossy(path: &PathBuf) -> Result<String> {
     if !path.exists() {
         return Ok(String::new());
@@ -959,8 +1199,39 @@ async fn health() -> Json<ApiEnvelope<Value>> {
     ok_json(serde_json::json!({ "status": "ok", "backend": "ferrous-native" }))
 }
 
-async fn dashboard() -> Html<&'static str> {
-    Html(DASHBOARD_HTML)
+async fn dashboard_root() -> Redirect {
+    Redirect::permanent("/fws/")
+}
+
+async fn dashboard_index() -> Response {
+    no_store_response("text/html; charset=utf-8", FWS_INDEX_HTML)
+}
+
+async fn legacy_logs_page(Path(shell_id): Path<String>) -> Response {
+    no_store_response(
+        "text/html; charset=utf-8",
+        FWS_LOGS_HTML.replace("{{ shell_id }}", &shell_id),
+    )
+}
+
+async fn fws_static(Path(path): Path<String>) -> Result<Response, ApiError> {
+    match path.as_str() {
+        "fws.css" => Ok(no_store_response("text/css; charset=utf-8", FWS_CSS)),
+        "fws.js" => Ok(no_store_response(
+            "application/javascript; charset=utf-8",
+            FWS_JS,
+        )),
+        "index.html" => Ok(no_store_response(
+            "text/html; charset=utf-8",
+            FWS_INDEX_HTML,
+        )),
+        "logs.html" => Ok(no_store_response("text/html; charset=utf-8", FWS_LOGS_HTML)),
+        _ => Err(not_found("Not found")),
+    }
+}
+
+async fn socketio_client_js() -> Response {
+    no_store_bytes_response("application/javascript; charset=utf-8", SOCKET_IO_CLIENT_JS)
 }
 
 async fn runtime_info(State(state): State<HostState>) -> Json<ApiEnvelope<HostInfoPayload>> {
@@ -1129,6 +1400,22 @@ async fn shutdown_app_group(
         .manager
         .shutdown_app_group_blocking(&app_id)
         .map_err(internal_error)?;
+    Ok(ok_json(result))
+}
+
+async fn shutdown_tree(
+    State(state): State<HostState>,
+    headers: HeaderMap,
+    body: Option<Json<ShutdownRequest>>,
+) -> Result<Json<ApiEnvelope<crate::shutdown::FerrousShutdownResult>>, ApiError> {
+    require_auth(&state, &headers)?;
+    let request = body.map(|Json(request)| request).unwrap_or_default();
+    let result = match request.scope.as_deref() {
+        Some("all") => state.manager.shutdown_all_blocking(),
+        Some("tree") | None => state.manager.shutdown_tree_blocking(request.root_pids),
+        Some(other) => return Err(bad_request(format!("Unknown shutdown scope: {other}"))),
+    }
+    .map_err(internal_error)?;
     Ok(ok_json(result))
 }
 
@@ -1339,6 +1626,23 @@ fn path_to_string(path: impl AsRef<FsPath>) -> String {
     path.as_ref().to_string_lossy().into_owned()
 }
 
+fn no_store_response(content_type: &'static str, body: impl Into<Body>) -> Response {
+    Response::builder()
+        .header(header::CONTENT_TYPE, content_type)
+        .header(
+            header::CACHE_CONTROL,
+            "no-store, no-cache, must-revalidate, max-age=0",
+        )
+        .header(header::PRAGMA, "no-cache")
+        .header(header::EXPIRES, "0")
+        .body(body.into())
+        .expect("static response builder is valid")
+}
+
+fn no_store_bytes_response(content_type: &'static str, body: &'static [u8]) -> Response {
+    no_store_response(content_type, Body::from(body.to_vec()))
+}
+
 fn default_tail_stream() -> String {
     "both".to_owned()
 }
@@ -1372,43 +1676,8 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     diff == 0
 }
 
-const DASHBOARD_HTML: &str = r#"<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Ferrous FWS</title>
-  <style>
-    body { margin: 0; font: 14px ui-monospace, SFMono-Regular, Menlo, monospace; background: #0d1117; color: #c9d1d9; }
-    header { padding: 16px 20px; border-bottom: 1px solid #30363d; background: #161b22; }
-    h1 { margin: 0; font-size: 18px; }
-    main { padding: 20px; }
-    button { color: #c9d1d9; background: #21262d; border: 1px solid #30363d; padding: 6px 10px; border-radius: 6px; }
-    pre { white-space: pre-wrap; background: #010409; border: 1px solid #30363d; border-radius: 8px; padding: 16px; }
-    .muted { color: #8b949e; }
-  </style>
-</head>
-<body>
-  <header><h1>Ferrous FWS Native Host</h1><div class="muted">Rust-owned MVP dashboard/control plane</div></header>
-  <main>
-    <button id="refresh">Refresh Shells</button>
-    <pre id="out">Loading...</pre>
-  </main>
-  <script>
-    async function refresh() {
-      const out = document.getElementById('out');
-      try {
-        const [runtime, shells] = await Promise.all([
-          fetch('/api/framework_shells/runtime').then((r) => r.json()),
-          fetch('/api/framework_shells').then((r) => r.json()),
-        ]);
-        out.textContent = JSON.stringify({ runtime, shells }, null, 2);
-      } catch (error) {
-        out.textContent = String(error && error.stack || error);
-      }
-    }
-    document.getElementById('refresh').addEventListener('click', refresh);
-    refresh();
-  </script>
-</body>
-</html>"#;
+const FWS_INDEX_HTML: &str = include_str!("../assets/fws_ui/index.html");
+const FWS_CSS: &str = include_str!("../assets/fws_ui/fws.css");
+const FWS_JS: &str = include_str!("../assets/fws_ui/fws.js");
+const FWS_LOGS_HTML: &str = include_str!("../assets/fws_ui/logs.html");
+const SOCKET_IO_CLIENT_JS: &[u8] = include_bytes!("../assets/vendor/socket.io.min.js");

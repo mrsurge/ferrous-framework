@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Framework Shells</title>
+    <link rel="stylesheet" href="/fws/static/fws.css" />
+  </head>
+  <body>
+    <div class="fws-header">
+      <div class="fws-header-left">
+        <div class="fws-title">Framework Shells</div>
+        <div class="fws-subtitle">Dashboard</div>
+      </div>
+      <div class="fws-header-right">
+        <div class="fws-status disconnected" id="fws-status">Connecting...</div>
+      </div>
+    </div>
+
+    <div class="fws-toolbar">
+      <form method="post" action="/fws/action/shutdown" class="fws-toolbar-form" data-fws-ajax="1">
+        <input type="hidden" name="scope" value="tree" />
+        <button type="submit" class="btn btn-danger">Shutdown Tree</button>
+      </form>
+      <form method="post" action="/fws/action/shutdown" class="fws-toolbar-form" data-fws-ajax="1">
+        <input type="hidden" name="scope" value="shells" />
+        <button type="submit" class="btn btn-secondary">Stop Shells Only</button>
+      </form>
+      <form
+        method="post"
+        action="/fws/action/logs/purge"
+        class="fws-toolbar-form"
+        data-fws-ajax="1"
+        data-confirm="Truncate ALL stdout/stderr logs for this runtime? (Shell records remain.)"
+      >
+        <button type="submit" class="btn btn-secondary">Truncate Logs</button>
+      </form>
+      <form method="post" action="/fws/action/refresh" class="fws-toolbar-form" data-fws-ajax="1">
+        <button type="submit" class="btn btn-secondary">Refresh</button>
+      </form>
+      <button type="button" class="btn btn-secondary" id="fws-toggle-all">Expand All</button>
+    </div>
+
+    <div class="fws-content" id="fws-content">
+      <div class="fws-loading">Loading...</div>
+    </div>
+
+    <div class="log-drawer" id="fws-log-drawer" aria-hidden="true">
+      <div class="log-drawer-header">
+        <div class="log-drawer-header-left">
+          <button type="button" class="btn btn-secondary btn-small" id="fws-log-back">Back</button>
+          <div>
+            <div class="log-drawer-title" id="fws-log-title">Shell Logs</div>
+            <div class="log-drawer-subtitle" id="fws-log-subtitle"></div>
+          </div>
+        </div>
+        <div class="log-drawer-header-right">
+          <label class="log-pause-toggle">
+            <input type="checkbox" id="fws-log-pause" />
+            <span>Pause</span>
+          </label>
+          <label class="log-pause-toggle is-disabled" id="fws-io-overlay-wrap">
+            <input type="checkbox" id="fws-io-overlay" disabled />
+            <span>IO overlay</span>
+          </label>
+          <div class="fws-status disconnected" id="fws-log-status">Disconnected</div>
+        </div>
+      </div>
+
+      <form class="stdin-injector" id="fws-stdin-form">
+        <div class="stdin-injector-header">
+          <div>
+            <div class="stdin-injector-title">STDIN Injection</div>
+            <div class="stdin-injector-subtitle" id="fws-stdin-status">Select a shell with live stdin.</div>
+          </div>
+          <div class="stdin-injector-actions">
+            <label class="stdin-newline-toggle">
+              <input type="checkbox" id="fws-stdin-newline" checked />
+              <span>Append newline</span>
+            </label>
+            <button type="submit" class="btn btn-small btn-secondary" id="fws-stdin-send">Send</button>
+            <button type="button" class="btn btn-small" id="fws-stdin-json-compact">Minify JSON</button>
+          </div>
+        </div>
+        <textarea
+          id="fws-stdin-input"
+          class="stdin-injector-input"
+          rows="3"
+          spellcheck="false"
+          placeholder='{"jsonrpc":"2.0","id":"probe","method":"ping","params":{}}'
+        ></textarea>
+      </form>
+
+      <div class="log-drawer-body">
+        <div class="log-pane">
+          <div class="log-pane-header stdout">
+            <div class="log-pane-title-row">
+              <div class="log-pane-title">STDOUT</div>
+              <label class="log-render-toggle">
+                <input type="checkbox" id="stdout-pretty-json" />
+                <span>Pretty JSON</span>
+              </label>
+            </div>
+            <div class="filters">
+              <div class="filter-row">
+                <input id="stdout-include-input" class="filter-input" type="text" placeholder="Include filter" />
+                <label class="mode"><input type="radio" name="stdout-include-mode" value="regex" checked />Regex</label>
+                <label class="mode"><input type="radio" name="stdout-include-mode" value="exact" />Exact</label>
+              </div>
+              <div class="filter-row">
+                <input id="stdout-exclude-input" class="filter-input" type="text" placeholder="Exclude filter" />
+                <label class="mode"><input type="radio" name="stdout-exclude-mode" value="regex" checked />Regex</label>
+                <label class="mode"><input type="radio" name="stdout-exclude-mode" value="exact" />Exact</label>
+              </div>
+            </div>
+          </div>
+          <div class="log-content" id="stdout-container"><div class="loading">Select a shell log.</div></div>
+        </div>
+
+        <div class="log-pane">
+          <div class="log-pane-header stderr">
+            <div class="log-pane-title-row">
+              <div class="log-pane-title">STDERR</div>
+              <label class="log-render-toggle">
+                <input type="checkbox" id="stderr-pretty-json" />
+                <span>Pretty JSON</span>
+              </label>
+            </div>
+            <div class="filters">
+              <div class="filter-row">
+                <input id="stderr-include-input" class="filter-input" type="text" placeholder="Include filter" />
+                <label class="mode"><input type="radio" name="stderr-include-mode" value="regex" checked />Regex</label>
+                <label class="mode"><input type="radio" name="stderr-include-mode" value="exact" />Exact</label>
+              </div>
+              <div class="filter-row">
+                <input id="stderr-exclude-input" class="filter-input" type="text" placeholder="Exclude filter" />
+                <label class="mode"><input type="radio" name="stderr-exclude-mode" value="regex" checked />Regex</label>
+                <label class="mode"><input type="radio" name="stderr-exclude-mode" value="exact" />Exact</label>
+              </div>
+            </div>
+          </div>
+          <div class="log-content" id="stderr-container"><div class="loading">Select a shell log.</div></div>
+        </div>
+      </div>
+    </div>
+
+    <script src="/fws/static/fws.js"></script>
+  </body>
+</html>

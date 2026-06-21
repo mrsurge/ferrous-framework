@@ -41,6 +41,8 @@ Current native API:
 - `ferrous_native_enabled`
 - `shellspec::render_shellspec_entry`
 - `FerrousNativeManager::spawn_shellspec_entry_blocking`
+- `FerrousNativeManager::shutdown_tree_blocking`
+- `FerrousNativeManager::shutdown_all_blocking`
 
 ## Native Backend Coverage
 
@@ -88,6 +90,8 @@ Fresh managers can load sidecar records from the canonical store logs directory.
 
 Capability records distinguish logs, live output reads, output subscriptions, stdin write, stdin EOF, terminate, and resize explicitly. PTY shells expose `resize_pty_blocking(...)` through the native manager. Adopted/stale records clear live-only controls even if the persisted record was created by a live owner.
 
+Framework shutdown hooks are native. `shutdown_tree_blocking(root_pids)` terminates matching Ferrous-owned live shell roots, and `shutdown_tree_blocking(Vec::new())` means all Ferrous-owned live shell roots. `shutdown_all_blocking()` is the explicit all-live-roots alias. These hooks return the same `FerrousShutdownResult` DTO as group shutdown. Current native tree/all shutdown does not yet walk arbitrary procfs descendants outside Ferrous ownership.
+
 ## Native Host / Control Plane
 
 `FerrousNativeHost` is the first Rust-owned FWS host MVP. It runs an Axum/Tokio HTTP server around `FerrousNativeManager` and does not depend on Python.
@@ -105,6 +109,7 @@ Current host surfaces:
 - `POST /api/framework_shells/{shell_id}/action`
 - `POST /api/framework_shells/{shell_id}/input`
 - `POST /api/framework_shells/app/{app_id}/shutdown`
+- `POST /api/framework_shells/shutdown`
 - `GET /api/framework_shells/logs/{shell_id}/tail`
 
 Mutating routes require the same API token shape as Python FWS: `HMAC(secret, "api")`, passed as `X-Framework-Key` or `Authorization: Bearer ...`. `derive_native_api_token(...)` exposes that token derivation for Rust callers and tests.
@@ -117,7 +122,7 @@ The host also owns a Socket.IO controller lane for FWS peer interoperability:
 - Peer event lane: `fws_peer_subscriptions`, `fws_peer_request`, and `fws_peer_notification`
 - Browser/dashboard lane: `fws_request` and `fws_notification`
 
-Peer auth uses the same shared-secret API token and runtime-id contract as Python FWS. Connected peers join the `fws:peers` room, receive active log-subscription hints, can return typed ack responses for `fws.shell.input`, and can push dashboard/log notifications back to the controller. The controller handles shell input local-first, then fans out to connected peers when local live input is unavailable. Group shutdown currently terminates Ferrous-owned live shell roots for the derived app/group id and returns the shutdown DTO shape.
+Peer auth uses the same shared-secret API token and runtime-id contract as Python FWS. Connected peers join the `fws:peers` room, receive active log-subscription hints, can return typed ack responses for `fws.shell.input`, and can push dashboard/log notifications back to the controller. The controller handles shell input local-first, then fans out to connected peers when local live input is unavailable. Group/tree/all shutdown currently terminates Ferrous-owned live shell roots and returns the shutdown DTO shape.
 
 `FerrousNativePeer` is the matching Rust peer-client MVP. It connects to a Python or Ferrous controller using the same base URL plus `/fws_ws/socket.io`, authenticates as `role: "peer"`, tracks `fws_peer_subscriptions`, handles `fws_peer_request` for `fws.shell.input` by calling the local native manager write/EOF primitives, and returns the required Socket.IO ack DTO. It also exposes `emit_notification(...)` for explicit peer notifications. Automatic native event/log relay over this peer client is intentionally not claimed yet.
 
