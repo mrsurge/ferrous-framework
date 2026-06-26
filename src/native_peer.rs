@@ -1,20 +1,34 @@
 use crate::native_host::derive_api_token;
-use crate::native_runtime::{FerrousNativeManager, FerrousShellInputResult};
+use crate::native_runtime::{
+    FerrousNativeLifecycleEvent, FerrousNativeLifecycleEventKind, FerrousNativeManager,
+    FerrousNativeOutputChunk, FerrousNativeOutputStream, FerrousNativeOutputSubscription,
+    FerrousNativeShellRecord, FerrousShellInputResult,
+};
 use crate::peer_protocol::{
-    FWS_PEER_NOTIFICATION_EVENT, FWS_PEER_REQUEST_EVENT, FWS_PEER_SUBSCRIPTIONS_EVENT,
-    FWS_SHELL_INPUT_METHOD, FWS_SOCKETIO_NAMESPACE, FWS_SOCKETIO_SOCKET_PATH,
-    FwsJsonRpcNotification, FwsPeerAuth, FwsPeerErrorResponse, FwsPeerResponse,
-    FwsPeerShellInputRequest, FwsPeerSubscriptions, FwsPeerSuccessResponse, notification_shell_id,
-    peer_notification_requires_subscription,
+    FWS_LOGS_CHUNK_METHOD, FWS_PEER_NOTIFICATION_EVENT, FWS_PEER_REQUEST_EVENT,
+    FWS_PEER_SUBSCRIPTIONS_EVENT, FWS_SHELL_INPUT_METHOD, FWS_SOCKETIO_NAMESPACE,
+    FWS_SOCKETIO_SOCKET_PATH, FwsJsonRpcNotification, FwsPeerAuth, FwsPeerErrorResponse,
+    FwsPeerResponse, FwsPeerShellInputRequest, FwsPeerSubscriptions, FwsPeerSuccessResponse,
+    notification_shell_id, peer_notification_requires_subscription,
 };
 use anyhow::{Context, Result, anyhow};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{
     collections::HashSet,
     process,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread::{self, JoinHandle},
+    time::Duration,
 };
 use tf_rust_socketio::{ClientBuilder, Payload, RawClient, TransportType, client::Client};
+use tokio::sync::broadcast::error::TryRecvError;
+
+const PEER_OUTPUT_SUBSCRIPTION_CAPACITY: usize = 1024;
+const PEER_RELAY_IDLE_SLEEP: Duration = Duration::from_millis(50);
+const PEER_RELAY_RECONCILE_INTERVAL: Duration = Duration::from_millis(200);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FerrousNativePeerConfig {
@@ -38,6 +52,8 @@ impl FerrousNativePeerConfig {
 pub struct FerrousNativePeer {
     client: Client,
     subscriptions: Arc<Mutex<HashSet<String>>>,
+    relay_shutdown: Arc<AtomicBool>,
+    relay_threads: Vec<JoinHandle<()>>,
 }
 
 impl FerrousNativePeer {
@@ -68,9 +84,18 @@ impl FerrousNativePeer {
         let client = builder
             .connect()
             .with_context(|| format!("failed to connect FWS peer to {}", config.controller_url))?;
+        let relay_shutdown = Arc::new(AtomicBool::new(false));
+        let relay_threads = start_relay_workers(
+            manager,
+            client.clone(),
+            Arc::clone(&subscriptions),
+            Arc::clone(&relay_shutdown),
+        );
         Ok(Self {
             client,
             subscriptions,
+            relay_shutdown,
+            relay_threads,
         })
     }
 
@@ -107,16 +132,12 @@ impl FerrousNativePeer {
                 return Ok(false);
             }
         }
-        self.client
-            .emit(
-                FWS_PEER_NOTIFICATION_EVENT,
-                serde_json::to_value(notification)?,
-            )
-            .map_err(|error| anyhow!("failed to emit FWS peer notification: {error}"))?;
+        emit_peer_notification(&self.client, notification)?;
         Ok(true)
     }
 
     pub fn disconnect(&self) -> Result<()> {
+        self.relay_shutdown.store(true, Ordering::Relaxed);
         self.client
             .disconnect()
             .map_err(|error| anyhow!("failed to disconnect FWS peer: {error}"))
@@ -125,8 +146,211 @@ impl FerrousNativePeer {
 
 impl Drop for FerrousNativePeer {
     fn drop(&mut self) {
+        self.relay_shutdown.store(true, Ordering::Relaxed);
         let _ = self.client.disconnect();
+        for thread in self.relay_threads.drain(..) {
+            let _ = thread.join();
+        }
     }
+}
+
+fn start_relay_workers(
+    manager: FerrousNativeManager,
+    client: Client,
+    subscriptions: Arc<Mutex<HashSet<String>>>,
+    shutdown: Arc<AtomicBool>,
+) -> Vec<JoinHandle<()>> {
+    vec![
+        start_lifecycle_relay(manager.clone(), client.clone(), Arc::clone(&shutdown)),
+        start_output_relay(manager, client, subscriptions, shutdown),
+    ]
+}
+
+fn start_lifecycle_relay(
+    manager: FerrousNativeManager,
+    client: Client,
+    shutdown: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        let mut events = manager.subscribe_lifecycle();
+        while !shutdown.load(Ordering::Relaxed) {
+            match events.try_recv() {
+                Ok(event) => {
+                    let _ = emit_peer_notification(&client, lifecycle_notification(event));
+                }
+                Err(TryRecvError::Empty) => thread::sleep(PEER_RELAY_IDLE_SLEEP),
+                Err(TryRecvError::Lagged(_)) => continue,
+                Err(TryRecvError::Closed) => break,
+            }
+        }
+    })
+}
+
+fn start_output_relay(
+    manager: FerrousNativeManager,
+    client: Client,
+    subscriptions: Arc<Mutex<HashSet<String>>>,
+    shutdown: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        let active_streams = Arc::new(Mutex::new(
+            HashSet::<(String, FerrousNativeOutputStream)>::new(),
+        ));
+        while !shutdown.load(Ordering::Relaxed) {
+            let desired = desired_output_streams(&subscriptions);
+            if let Ok(mut active) = active_streams.lock() {
+                active.retain(|key| desired.contains(key));
+            }
+            for (shell_id, stream) in desired {
+                let key = (shell_id.clone(), stream);
+                let already_active = active_streams
+                    .lock()
+                    .map(|active| active.contains(&key))
+                    .unwrap_or(true);
+                if already_active {
+                    continue;
+                }
+                let Ok(Some(subscription)) =
+                    manager.subscribe_output(&shell_id, stream, PEER_OUTPUT_SUBSCRIPTION_CAPACITY)
+                else {
+                    continue;
+                };
+                if let Ok(mut active) = active_streams.lock() {
+                    active.insert(key.clone());
+                }
+                spawn_output_stream_relay(
+                    client.clone(),
+                    subscription,
+                    key,
+                    Arc::clone(&active_streams),
+                    Arc::clone(&shutdown),
+                );
+            }
+            thread::sleep(PEER_RELAY_RECONCILE_INTERVAL);
+        }
+    })
+}
+
+fn desired_output_streams(
+    subscriptions: &Arc<Mutex<HashSet<String>>>,
+) -> HashSet<(String, FerrousNativeOutputStream)> {
+    let Ok(subscriptions) = subscriptions.lock() else {
+        return HashSet::new();
+    };
+    subscriptions
+        .iter()
+        .flat_map(|shell_id| {
+            [
+                (shell_id.clone(), FerrousNativeOutputStream::Stdout),
+                (shell_id.clone(), FerrousNativeOutputStream::Stderr),
+            ]
+        })
+        .collect()
+}
+
+fn spawn_output_stream_relay(
+    client: Client,
+    subscription: FerrousNativeOutputSubscription,
+    key: (String, FerrousNativeOutputStream),
+    active_streams: Arc<Mutex<HashSet<(String, FerrousNativeOutputStream)>>>,
+    shutdown: Arc<AtomicBool>,
+) {
+    thread::spawn(move || {
+        while !shutdown.load(Ordering::Relaxed)
+            && active_streams
+                .lock()
+                .map(|active| active.contains(&key))
+                .unwrap_or(false)
+        {
+            match subscription.recv_timeout(PEER_RELAY_RECONCILE_INTERVAL) {
+                Ok(Some(chunk)) => {
+                    let _ = emit_peer_notification(&client, output_chunk_notification(chunk));
+                }
+                Ok(None) => {}
+                Err(_) => break,
+            }
+        }
+        if let Ok(mut active) = active_streams.lock() {
+            active.remove(&key);
+        }
+    });
+}
+
+fn lifecycle_notification(event: FerrousNativeLifecycleEvent) -> FwsJsonRpcNotification {
+    let method = match event.kind {
+        FerrousNativeLifecycleEventKind::Spawned => "fws.shell.spawned",
+        FerrousNativeLifecycleEventKind::Updated => "fws.shell.updated",
+        FerrousNativeLifecycleEventKind::Exited => "fws.shell.exited",
+    };
+    FwsJsonRpcNotification {
+        jsonrpc: "2.0".to_owned(),
+        method: method.to_owned(),
+        params: json!({ "shell": shell_payload_value(event.shell) }),
+    }
+}
+
+fn output_chunk_notification(chunk: FerrousNativeOutputChunk) -> FwsJsonRpcNotification {
+    FwsJsonRpcNotification {
+        jsonrpc: "2.0".to_owned(),
+        method: FWS_LOGS_CHUNK_METHOD.to_owned(),
+        params: json!({
+            "shell_id": chunk.shell_id,
+            "stream": output_stream_name(chunk.stream),
+            "chunk": String::from_utf8_lossy(&chunk.bytes).into_owned(),
+            "dropped_before": chunk.dropped_before,
+        }),
+    }
+}
+
+fn output_stream_name(stream: FerrousNativeOutputStream) -> &'static str {
+    match stream {
+        FerrousNativeOutputStream::Stdout => "stdout",
+        FerrousNativeOutputStream::Stderr => "stderr",
+    }
+}
+
+fn emit_peer_notification(client: &Client, notification: FwsJsonRpcNotification) -> Result<()> {
+    client
+        .emit(
+            FWS_PEER_NOTIFICATION_EVENT,
+            serde_json::to_value(notification)?,
+        )
+        .map_err(|error| anyhow!("failed to emit FWS peer notification: {error}"))
+}
+
+fn shell_payload_value(record: FerrousNativeShellRecord) -> Value {
+    json!({
+        "id": record.id,
+        "spec_id": record.spec_id,
+        "backend": record.backend,
+        "command": record.command,
+        "cwd": record.cwd.map(|path| path.to_string_lossy().into_owned()),
+        "pid": record.pid,
+        "status": record.status,
+        "exit_code": record.exit_code,
+        "label": record.label,
+        "subgroups": record.subgroups,
+        "record_path": record.record_path.to_string_lossy().into_owned(),
+        "stdout_log": record.stdout_log.to_string_lossy().into_owned(),
+        "stderr_log": record.stderr_log.to_string_lossy().into_owned(),
+        "io_metadata_log": record.io_metadata_log.map(|path| path.to_string_lossy().into_owned()),
+        "pty_mode": record.pty_mode,
+        "autostart": record.autostart,
+        "ui": Value::Object(record.ui),
+        "debug": Value::Object(record.debug),
+        "runtime_id": record.runtime_id,
+        "app_id": record.app_id,
+        "parent_shell_id": record.parent_shell_id,
+        "is_app_worker": record.is_app_worker,
+        "capabilities": record.capabilities,
+        "adopted": record.adopted,
+        "created_at": record.created_at_ms as f64 / 1000.0,
+        "updated_at": record.updated_at_ms as f64 / 1000.0,
+        "created_at_ms": record.created_at_ms,
+        "updated_at_ms": record.updated_at_ms,
+        "env_keys": record.env_keys,
+        "env_overrides": record.env_overrides,
+    })
 }
 
 fn socketio_url(controller_url: &str) -> String {

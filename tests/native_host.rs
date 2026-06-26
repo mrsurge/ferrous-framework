@@ -1,7 +1,7 @@
 use ferrous_framework::{
     FerrousNativeEnv, FerrousNativeHost, FerrousNativeHostConfig, FerrousNativeManager,
-    FerrousNativePeer, FerrousNativePeerConfig, FerrousNativePipeConfig, FerrousNativeStore,
-    derive_native_api_token,
+    FerrousNativePeer, FerrousNativePeerConfig, FerrousNativePipeConfig, FerrousNativeProcConfig,
+    FerrousNativeStore, derive_native_api_token,
 };
 use serde_json::{Value, json};
 use std::{
@@ -269,6 +269,42 @@ fn native_host_routes_shell_input_to_ferrous_peer() {
     host.close_blocking().expect("close host");
 }
 
+#[test]
+fn native_peer_relays_lifecycle_notifications_to_controller() {
+    let secret = "ferrous-peer-notification-secret".to_owned();
+    let host_manager = test_manager_with_secret("peer-notify-controller", secret.clone());
+    let peer_manager = test_manager_with_secret("peer-notify-owner", secret.clone());
+    let host =
+        FerrousNativeHost::spawn_with_manager(FerrousNativeHostConfig::default(), host_manager)
+            .expect("spawn native host");
+    let addr = host.addr();
+
+    let peer = FerrousNativePeer::connect(
+        peer_manager.clone(),
+        FerrousNativePeerConfig::new(host.url()),
+    )
+    .expect("connect ferrous peer");
+    wait_for_peer_count(addr, 1);
+    let baseline = peer_notifications_received(addr);
+
+    let shell = peer_manager
+        .spawn_proc_blocking(FerrousNativeProcConfig {
+            command: vec!["sh".into(), "-c".into(), "sleep 0.2".into()],
+            cwd: None,
+            env: HashMap::new(),
+            label: "peer-notify-proc".into(),
+            spec_id: "peer-notify-proc".into(),
+            subgroups: vec!["peer-tests".into()],
+            log_dir: None,
+        })
+        .expect("spawn peer proc");
+
+    wait_for_peer_notifications(addr, baseline + 1);
+    let _ = peer_manager.terminate_shell_strict_blocking(&shell.id, true);
+    peer.disconnect().expect("disconnect peer");
+    host.close_blocking().expect("close host");
+}
+
 fn wait_for_peer_count(addr: SocketAddr, expected: usize) {
     for _ in 0..50 {
         let (status, body) = request(addr, "GET", "/api/framework_shells/runtime", &[], "");
@@ -283,6 +319,25 @@ fn wait_for_peer_count(addr: SocketAddr, expected: usize) {
         thread::sleep(Duration::from_millis(20));
     }
     panic!("timed out waiting for peer_count={expected}");
+}
+
+fn peer_notifications_received(addr: SocketAddr) -> u64 {
+    let (status, body) = request(addr, "GET", "/api/framework_shells/runtime", &[], "");
+    assert_eq!(status, 200, "body: {body}");
+    json_body(&body)["data"]["peer_notifications_received"]
+        .as_u64()
+        .unwrap_or_default()
+}
+
+fn wait_for_peer_notifications(addr: SocketAddr, expected_at_least: u64) {
+    for _ in 0..50 {
+        let count = peer_notifications_received(addr);
+        if count >= expected_at_least {
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!("timed out waiting for peer_notifications_received >= {expected_at_least}");
 }
 
 fn request(
