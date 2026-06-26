@@ -1,8 +1,14 @@
 # ferrous-framework
 
-`ferrous-framework` is a Rust runtime crate for framework-shells-compatible process management.
+`ferrous-framework` is the Rust implementation of the FWS process-runtime contract.
 
-Current direction: a Rust-compiled FWS-compatible manager/runtime suite with Rust-owned `proc`, `pipe`, and `pty` support. Python is not part of the crate runtime path.
+It gives Rust applications the same process-supervision model as Python [`framework-shells`](https://github.com/mrsurge/framework-shells): shellspec rendering, runtime-scoped metadata, logs, capabilities, dashboard/control-plane compatibility, peer-manager interop, and shutdown behavior.
+
+Python is not part of the crate runtime path. The native manager owns `proc`, `pipe`, and `pty` execution directly in Rust.
+
+Use `ferrous-framework` when a Rust host needs FWS-compatible process supervision, when Python should not sit on the hot path for process I/O, or when a compiled framework wants to keep runtime behavior configurable through shellspecs.
+
+Use Python `framework-shells` when the host runtime is Python, when FastAPI/ASGI mounting is the primary integration point, or when the Python implementation is the better reference surface for a consumer.
 
 ## Native Runtime Shape
 
@@ -12,6 +18,22 @@ Rust application
   -> Rust-owned proc/pipe/pty runtime
   -> FWS-compatible records, logs, capabilities, and lifecycle metadata
 ```
+
+The boundary matches FWS:
+
+- Ferrous owns launch, shutdown, shellspec rendering, runtime metadata, logs, capabilities, dashboard/control surfaces, and peer-manager coordination.
+- The application owns its protocol, request routing, DTOs, and business logic.
+
+The `pipe` backend is a supervised stdin/stdout/stderr byte stream. Ferrous does not parse JSON-RPC, line protocols, editor control messages, or application DTOs unless a caller adds that layer above the runtime.
+
+## What This Is Not
+
+- It is not a Python bridge.
+- It is not a protocol framework.
+- It is not a terminal emulator.
+- It is not a separate FWS dialect.
+
+The target is interoperability: Python FWS and Ferrous managers should be able to share metadata, dashboard/control-plane semantics, shellspec conventions, and peer lanes while letting each host keep its own runtime implementation.
 
 ## Public API
 
