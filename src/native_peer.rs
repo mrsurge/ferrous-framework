@@ -11,7 +11,7 @@ use crate::peer_protocol::{
     FwsPeerResponse, FwsPeerShellInputRequest, FwsPeerSubscriptions, FwsPeerSuccessResponse,
     notification_shell_id, peer_notification_requires_subscription,
 };
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
@@ -24,7 +24,10 @@ use std::{
     thread::{self, JoinHandle},
 };
 use tf_rust_socketio::{ClientBuilder, Payload, RawClient, TransportType, client::Client};
-use tokio::sync::{broadcast::error::RecvError, watch};
+use tokio::sync::{
+    broadcast::{Receiver as TokioBroadcastReceiver, error::RecvError},
+    watch,
+};
 
 const PEER_OUTPUT_SUBSCRIPTION_CAPACITY: usize = 1024;
 
@@ -48,45 +51,41 @@ impl FerrousNativePeerConfig {
 }
 
 pub struct FerrousNativePeer {
-    client: Client,
+    client: PeerClientHandle,
     subscriptions: Arc<Mutex<HashSet<String>>>,
     relay_shutdown: Arc<AtomicBool>,
     relay_shutdown_tx: watch::Sender<bool>,
     subscription_wake: Sender<()>,
     relay_threads: Vec<JoinHandle<()>>,
+    client_thread: Option<JoinHandle<()>>,
+}
+
+#[derive(Clone)]
+struct PeerClientHandle {
+    command_tx: Sender<PeerClientCommand>,
+}
+
+enum PeerClientCommand {
+    Emit {
+        notification: FwsJsonRpcNotification,
+        response_tx: Sender<std::result::Result<(), String>>,
+    },
+    Disconnect {
+        response_tx: Sender<std::result::Result<(), String>>,
+    },
 }
 
 impl FerrousNativePeer {
     pub fn connect(manager: FerrousNativeManager, config: FerrousNativePeerConfig) -> Result<Self> {
         let subscriptions = Arc::new(Mutex::new(HashSet::new()));
-        let subscription_state = Arc::clone(&subscriptions);
         let (subscription_tx, subscription_rx) = mpsc::channel::<()>();
-        let subscription_wake_for_event = subscription_tx.clone();
-        let request_manager = manager.clone();
-        let auth = FwsPeerAuth::new(
-            derive_api_token(&manager.native_env().secret),
-            manager.store().runtime_id,
-            process::id().to_string(),
-        );
-        let mut builder = ClientBuilder::new(socketio_url(&config.controller_url))
-            .namespace(FWS_SOCKETIO_NAMESPACE)
-            .transport_type(TransportType::Websocket)
-            .reconnect(config.reconnect)
-            .reconnect_on_disconnect(config.reconnect_on_disconnect)
-            .auth(serde_json::to_value(auth)?)
-            .on(FWS_PEER_SUBSCRIPTIONS_EVENT, move |payload, _socket| {
-                update_subscriptions(&subscription_state, payload);
-                let _ = subscription_wake_for_event.send(());
-            })
-            .on(FWS_PEER_REQUEST_EVENT, move |payload, socket| {
-                acknowledge_peer_request(&request_manager, payload, socket);
-            });
-        if let Some(max_reconnect_attempts) = config.max_reconnect_attempts {
-            builder = builder.max_reconnect_attempts(max_reconnect_attempts);
-        }
-        let client = builder
-            .connect()
-            .with_context(|| format!("failed to connect FWS peer to {}", config.controller_url))?;
+        let lifecycle_events = manager.subscribe_lifecycle();
+        let (client, client_thread) = start_peer_client_thread(
+            manager.clone(),
+            config,
+            Arc::clone(&subscriptions),
+            subscription_tx.clone(),
+        )?;
         let relay_shutdown = Arc::new(AtomicBool::new(false));
         let (relay_shutdown_tx, relay_shutdown_rx) = watch::channel(false);
         let relay_threads = start_relay_workers(
@@ -96,6 +95,7 @@ impl FerrousNativePeer {
             Arc::clone(&relay_shutdown),
             relay_shutdown_rx,
             subscription_rx,
+            lifecycle_events,
         );
         let _ = subscription_tx.send(());
         Ok(Self {
@@ -105,6 +105,7 @@ impl FerrousNativePeer {
             relay_shutdown_tx,
             subscription_wake: subscription_tx,
             relay_threads,
+            client_thread: Some(client_thread),
         })
     }
 
@@ -149,9 +150,7 @@ impl FerrousNativePeer {
         self.relay_shutdown.store(true, Ordering::Relaxed);
         let _ = self.relay_shutdown_tx.send(true);
         let _ = self.subscription_wake.send(());
-        self.client
-            .disconnect()
-            .map_err(|error| anyhow!("failed to disconnect FWS peer: {error}"))
+        self.client.disconnect()
     }
 }
 
@@ -164,18 +163,147 @@ impl Drop for FerrousNativePeer {
         for thread in self.relay_threads.drain(..) {
             let _ = thread.join();
         }
+        if let Some(thread) = self.client_thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl PeerClientHandle {
+    fn emit(&self, notification: FwsJsonRpcNotification) -> Result<()> {
+        let (response_tx, response_rx) = mpsc::channel::<std::result::Result<(), String>>();
+        self.command_tx
+            .send(PeerClientCommand::Emit {
+                notification,
+                response_tx,
+            })
+            .map_err(|_| anyhow!("FWS peer client thread is closed"))?;
+        match response_rx.recv() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(anyhow!(error)),
+            Err(_) => Err(anyhow!(
+                "FWS peer client thread closed before emit completed"
+            )),
+        }
+    }
+
+    fn disconnect(&self) -> Result<()> {
+        let (response_tx, response_rx) = mpsc::channel::<std::result::Result<(), String>>();
+        self.command_tx
+            .send(PeerClientCommand::Disconnect { response_tx })
+            .map_err(|_| anyhow!("FWS peer client thread is closed"))?;
+        match response_rx.recv() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(anyhow!(error)),
+            Err(_) => Err(anyhow!(
+                "FWS peer client thread closed before disconnect completed"
+            )),
+        }
+    }
+}
+
+fn start_peer_client_thread(
+    manager: FerrousNativeManager,
+    config: FerrousNativePeerConfig,
+    subscriptions: Arc<Mutex<HashSet<String>>>,
+    subscription_wake_for_event: Sender<()>,
+) -> Result<(PeerClientHandle, JoinHandle<()>)> {
+    let (command_tx, command_rx) = mpsc::channel::<PeerClientCommand>();
+    let (startup_tx, startup_rx) = mpsc::channel::<std::result::Result<(), String>>();
+    let controller_url = config.controller_url.clone();
+    let thread = thread::spawn(move || {
+        let auth = FwsPeerAuth::new(
+            derive_api_token(&manager.native_env().secret),
+            manager.store().runtime_id,
+            process::id().to_string(),
+        );
+        let mut builder = match serde_json::to_value(auth) {
+            Ok(auth_value) => ClientBuilder::new(socketio_url(&config.controller_url))
+                .namespace(FWS_SOCKETIO_NAMESPACE)
+                .transport_type(TransportType::Websocket)
+                .reconnect(config.reconnect)
+                .reconnect_on_disconnect(config.reconnect_on_disconnect)
+                .auth(auth_value),
+            Err(error) => {
+                let _ = startup_tx.send(Err(error.to_string()));
+                return;
+            }
+        };
+        if let Some(max_reconnect_attempts) = config.max_reconnect_attempts {
+            builder = builder.max_reconnect_attempts(max_reconnect_attempts);
+        }
+        let subscription_state = Arc::clone(&subscriptions);
+        let request_manager = manager.clone();
+        let client_result = builder
+            .on(FWS_PEER_SUBSCRIPTIONS_EVENT, move |payload, _socket| {
+                update_subscriptions(&subscription_state, payload);
+                let _ = subscription_wake_for_event.send(());
+            })
+            .on(FWS_PEER_REQUEST_EVENT, move |payload, socket| {
+                acknowledge_peer_request(&request_manager, payload, socket);
+            })
+            .connect();
+        let Ok(client) = client_result else {
+            let error = client_result
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "unknown FWS peer connect error".to_owned());
+            let _ = startup_tx.send(Err(error));
+            return;
+        };
+        let _ = startup_tx.send(Ok(()));
+        let mut disconnected = false;
+        while let Ok(command) = command_rx.recv() {
+            match command {
+                PeerClientCommand::Emit {
+                    notification,
+                    response_tx,
+                } => {
+                    let result = emit_peer_notification_direct(&client, notification)
+                        .map_err(|error| error.to_string());
+                    let _ = response_tx.send(result);
+                }
+                PeerClientCommand::Disconnect { response_tx } => {
+                    let result = client
+                        .disconnect()
+                        .map_err(|error| format!("failed to disconnect FWS peer: {error}"));
+                    disconnected = result.is_ok();
+                    let _ = response_tx.send(result);
+                    break;
+                }
+            }
+        }
+        if !disconnected {
+            let _ = client.disconnect();
+        }
+    });
+    match startup_rx.recv() {
+        Ok(Ok(())) => Ok((PeerClientHandle { command_tx }, thread)),
+        Ok(Err(error)) => {
+            let _ = thread.join();
+            Err(anyhow!(
+                "failed to connect FWS peer to {controller_url}: {error}"
+            ))
+        }
+        Err(_) => {
+            let _ = thread.join();
+            Err(anyhow!(
+                "failed to connect FWS peer to {controller_url}: client thread exited"
+            ))
+        }
     }
 }
 
 fn start_relay_workers(
     manager: FerrousNativeManager,
-    client: Client,
+    client: PeerClientHandle,
     subscriptions: Arc<Mutex<HashSet<String>>>,
     shutdown: Arc<AtomicBool>,
     lifecycle_shutdown: watch::Receiver<bool>,
     subscription_rx: Receiver<()>,
+    lifecycle_events: TokioBroadcastReceiver<FerrousNativeLifecycleEvent>,
 ) -> Vec<JoinHandle<()>> {
-    let mut threads = start_lifecycle_relay(manager.clone(), client.clone(), lifecycle_shutdown);
+    let mut threads = start_lifecycle_relay(client.clone(), lifecycle_shutdown, lifecycle_events);
     threads.push(start_output_relay(
         manager,
         client,
@@ -187,12 +315,11 @@ fn start_relay_workers(
 }
 
 fn start_lifecycle_relay(
-    manager: FerrousNativeManager,
-    client: Client,
+    client: PeerClientHandle,
     mut shutdown: watch::Receiver<bool>,
+    mut events: TokioBroadcastReceiver<FerrousNativeLifecycleEvent>,
 ) -> Vec<JoinHandle<()>> {
     let (notification_tx, notification_rx) = mpsc::channel::<FwsJsonRpcNotification>();
-    let mut events = manager.subscribe_lifecycle();
     let event_thread = thread::spawn(move || {
         let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -232,7 +359,7 @@ fn start_lifecycle_relay(
 
 fn start_output_relay(
     manager: FerrousNativeManager,
-    client: Client,
+    client: PeerClientHandle,
     subscriptions: Arc<Mutex<HashSet<String>>>,
     shutdown: Arc<AtomicBool>,
     subscription_rx: Receiver<()>,
@@ -270,7 +397,7 @@ fn start_output_relay(
 
 fn ensure_peer_output_streams(
     manager: &FerrousNativeManager,
-    client: &Client,
+    client: &PeerClientHandle,
     subscriptions: &Arc<Mutex<HashSet<String>>>,
     active_streams: Arc<
         Mutex<HashMap<(String, FerrousNativeOutputStream), FerrousNativeOutputSubscriptionStopper>>,
@@ -336,7 +463,7 @@ fn desired_output_streams(
 }
 
 fn spawn_output_stream_relay(
-    client: Client,
+    client: PeerClientHandle,
     subscription: FerrousNativeOutputSubscription,
     key: (String, FerrousNativeOutputStream),
     active_streams: Arc<
@@ -401,7 +528,17 @@ fn output_stream_name(stream: FerrousNativeOutputStream) -> &'static str {
     }
 }
 
-fn emit_peer_notification(client: &Client, notification: FwsJsonRpcNotification) -> Result<()> {
+fn emit_peer_notification(
+    client: &PeerClientHandle,
+    notification: FwsJsonRpcNotification,
+) -> Result<()> {
+    client.emit(notification)
+}
+
+fn emit_peer_notification_direct(
+    client: &Client,
+    notification: FwsJsonRpcNotification,
+) -> Result<()> {
     client
         .emit(
             FWS_PEER_NOTIFICATION_EVENT,

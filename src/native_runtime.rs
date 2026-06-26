@@ -640,16 +640,21 @@ impl FerrousNativeManager {
             return;
         }
         let peer_manager = self.clone_without_parent_peer();
-        match crate::native_peer::FerrousNativePeer::connect_from_manager_env(peer_manager) {
-            Ok(peer) => {
-                if let Ok(mut parent_peer) = self.parent_peer.lock() {
-                    *parent_peer = Some(peer);
+        let parent_peer = Arc::clone(&self.parent_peer);
+        thread::spawn(
+            move || match crate::native_peer::FerrousNativePeer::connect_from_manager_env(
+                peer_manager,
+            ) {
+                Ok(peer) => {
+                    if let Ok(mut parent_peer) = parent_peer.lock() {
+                        *parent_peer = Some(peer);
+                    }
                 }
-            }
-            Err(error) => {
-                eprintln!("[ferrous-framework] fws parent peer connect failed: {error:#}");
-            }
-        }
+                Err(error) => {
+                    eprintln!("[ferrous-framework] fws parent peer connect failed: {error:#}");
+                }
+            },
+        );
     }
 
     pub fn store(&self) -> FerrousNativeStore {

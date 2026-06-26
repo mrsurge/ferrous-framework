@@ -452,6 +452,27 @@ fn native_child_manager_auto_peer_relays_lifecycle_and_logs_to_parent() {
 }
 
 #[test]
+fn native_child_manager_auto_peer_can_start_inside_tokio_runtime() {
+    let secret = "ferrous-auto-peer-tokio-secret".to_owned();
+    let host_manager = test_manager_with_secret("auto-peer-tokio-controller", secret.clone());
+    let host =
+        FerrousNativeHost::spawn_with_manager(FerrousNativeHostConfig::default(), host_manager)
+            .expect("spawn native host");
+    let addr = host.addr();
+    let host_url = host.url();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let child_manager = runtime.block_on(async move {
+        test_child_manager_with_parent_url("auto-peer-tokio-child", secret, host_url)
+    });
+    wait_for_peer_count(addr, 1);
+    drop(child_manager);
+    host.close_blocking().expect("close host");
+}
+
+#[test]
 fn native_dashboard_receives_local_pipe_log_chunks() {
     let manager = test_manager("local-dashboard-logs");
     let host =
@@ -591,9 +612,11 @@ fn open_shell_logs(client: &Client, shell_id: &str) {
 }
 
 fn emit_dashboard_request(client: &Client, method: &str, params: Value, id: &str) {
-    let (ack_tx, ack_rx) = mpsc::channel::<Value>();
-    client
-        .emit_with_ack(
+    let mut last_error = None;
+    let mut ack_rx_result = None;
+    for _ in 0..40 {
+        let (ack_tx, ack_rx) = mpsc::channel::<Value>();
+        match client.emit_with_ack(
             FWS_REQUEST_EVENT,
             json!({
                 "jsonrpc": "2.0",
@@ -607,11 +630,22 @@ fn emit_dashboard_request(client: &Client, method: &str, params: Value, id: &str
                     let _ = ack_tx.send(value);
                 }
             },
-        )
-        .expect("emit dashboard request");
+        ) {
+            Ok(()) => {
+                ack_rx_result = Some(ack_rx);
+                break;
+            }
+            Err(error) => {
+                last_error = Some(error.to_string());
+                thread::sleep(Duration::from_millis(25));
+            }
+        }
+    }
+    let ack_rx = ack_rx_result
+        .unwrap_or_else(|| panic!("emit dashboard request failed for {method}: {last_error:?}"));
     let ack = ack_rx
         .recv_timeout(Duration::from_secs(3))
-        .unwrap_or_else(|error| panic!("{method} ack timeout: {error}"));
+        .unwrap_or_else(|error| panic!("{method} ack timeout: {error}; emit_error={last_error:?}"));
     assert!(
         ack.get("result").is_some() || ack.get("error").is_some(),
         "unexpected {method} ack: {ack}"
