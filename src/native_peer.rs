@@ -192,8 +192,8 @@ fn start_lifecycle_relay(
     mut shutdown: watch::Receiver<bool>,
 ) -> Vec<JoinHandle<()>> {
     let (notification_tx, notification_rx) = mpsc::channel::<FwsJsonRpcNotification>();
+    let mut events = manager.subscribe_lifecycle();
     let event_thread = thread::spawn(move || {
-        let mut events = manager.subscribe_lifecycle();
         let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

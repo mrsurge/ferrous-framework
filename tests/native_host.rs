@@ -58,6 +58,29 @@ fn test_manager_with_secret(name: &str, secret: String) -> FerrousNativeManager 
     )
 }
 
+fn test_child_manager_with_parent_url(
+    name: &str,
+    secret: String,
+    parent_url: String,
+) -> FerrousNativeManager {
+    let store = FerrousNativeStore::from_base_dir_fingerprint_secret(
+        test_log_dir(name).join("fws-base"),
+        "host_test_fingerprint".to_owned(),
+        secret.clone(),
+    )
+    .expect("test native store");
+    FerrousNativeManager::with_store_and_env(
+        store,
+        FerrousNativeEnv {
+            secret,
+            run_id: format!("host-run-{name}"),
+            fws_socketio_url: Some(parent_url.clone()),
+            te_framework_url: Some(parent_url),
+            extra: HashMap::from([("FRAMEWORK_SHELLS_FWS_CHILD".to_owned(), "1".to_owned())]),
+        },
+    )
+}
+
 #[test]
 fn native_host_serves_control_plane_and_shell_io() {
     let manager = test_manager("control-plane");
@@ -102,6 +125,7 @@ fn native_host_serves_control_plane_and_shell_io() {
         env.get("FRAMEWORK_SHELLS_FWS_SOCKETIO_URL"),
         Some(&host.url())
     );
+    assert_eq!(env.get("FRAMEWORK_SHELLS_FWS_CHILD"), Some(&"1".to_owned()));
     assert!(env.contains_key("FRAMEWORK_SHELLS_SECRET"));
 
     let create = json!({
@@ -379,6 +403,51 @@ fn native_dashboard_receives_peer_shell_lifecycle_notifications() {
 
     browser.disconnect().expect("disconnect browser");
     peer.disconnect().expect("disconnect peer");
+    host.close_blocking().expect("close host");
+}
+
+#[test]
+fn native_child_manager_auto_peer_relays_lifecycle_and_logs_to_parent() {
+    let secret = "ferrous-auto-peer-dashboard-secret".to_owned();
+    let host_manager = test_manager_with_secret("auto-peer-controller", secret.clone());
+    let host =
+        FerrousNativeHost::spawn_with_manager(FerrousNativeHostConfig::default(), host_manager)
+            .expect("spawn native host");
+    let addr = host.addr();
+    let child_manager = test_child_manager_with_parent_url("auto-peer-child", secret, host.url());
+    wait_for_peer_count(addr, 1);
+    let (browser, notifications) = connect_dashboard_browser(&host);
+
+    let shell = child_manager
+        .spawn_pipe_blocking(FerrousNativePipeConfig {
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "while IFS= read -r line; do printf 'auto-peer-log:%s\\n' \"$line\"; done".into(),
+            ],
+            cwd: None,
+            env: HashMap::new(),
+            label: "auto-peer-dashboard-pipe".into(),
+            spec_id: "auto-peer-dashboard-pipe".into(),
+            subgroups: vec!["dashboard-tests".into()],
+            log_dir: None,
+        })
+        .expect("spawn auto-peer child pipe");
+
+    wait_for_shell_lifecycle_notification(&notifications, "fws.shell.spawned", &shell.id);
+    open_shell_logs(&browser, &shell.id);
+    child_manager
+        .write_line_blocking(&shell.id, "probe")
+        .expect("write auto-peer child pipe");
+    let line = child_manager
+        .read_line_blocking(&shell.id, Duration::from_secs(3))
+        .expect("read auto-peer child pipe")
+        .expect("auto-peer child pipe response");
+    assert!(line.contains("auto-peer-log:probe"));
+    wait_for_log_chunk_notification(&notifications, &shell.id, "auto-peer-log:probe");
+
+    browser.disconnect().expect("disconnect browser");
+    let _ = child_manager.terminate_shell_strict_blocking(&shell.id, true);
     host.close_blocking().expect("close host");
 }
 

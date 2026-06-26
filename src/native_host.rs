@@ -269,7 +269,8 @@ impl FerrousNativeHost {
         if native_env.te_framework_url.is_none() {
             native_env.te_framework_url = Some(url_for_addr(addr));
         }
-        let manager = FerrousNativeManager::with_store_and_env(store, native_env);
+        let manager =
+            FerrousNativeManager::with_store_and_env_without_parent_peer(store, native_env);
         Self::spawn_with_listener(config, manager, listener, addr)
     }
 
@@ -1100,11 +1101,17 @@ fn dashboard_state_response(
 }
 
 async fn emit_logs_initial(socket: &SocketRef, state: &HostState, shell_id: &str) -> Result<()> {
-    let Some(record) = state.manager.get_shell(shell_id)? else {
+    if shell_id.trim().is_empty() {
         return Err(anyhow!("Shell not found: {shell_id}"));
+    }
+    let (stdout, stderr) = match state.manager.get_shell(shell_id)? {
+        Some(record) => (
+            read_log_text_lossy(&record.stdout_log)?,
+            read_log_text_lossy(&record.stderr_log)?,
+        ),
+        None if state.socketio_runtime.peer_count() > 0 => (String::new(), String::new()),
+        None => return Err(anyhow!("Shell not found: {shell_id}")),
     };
-    let stdout = read_log_text_lossy(&record.stdout_log)?;
-    let stderr = read_log_text_lossy(&record.stderr_log)?;
     let notification = FwsJsonRpcNotification {
         jsonrpc: "2.0".to_owned(),
         method: FWS_LOGS_INITIAL_METHOD.to_owned(),

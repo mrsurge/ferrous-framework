@@ -46,6 +46,10 @@ const FRAMEWORK_SHELLS_SECRET_KEY: &str = "FRAMEWORK_SHELLS_SECRET";
 const FRAMEWORK_SHELLS_RUN_ID_KEY: &str = "FRAMEWORK_SHELLS_RUN_ID";
 const FRAMEWORK_SHELLS_FWS_SOCKETIO_URL_KEY: &str = "FRAMEWORK_SHELLS_FWS_SOCKETIO_URL";
 const TE_FRAMEWORK_URL_KEY: &str = "TE_FRAMEWORK_URL";
+const FRAMEWORK_SHELLS_FWS_CHILD_KEY: &str = "FRAMEWORK_SHELLS_FWS_CHILD";
+const LEGACY_FWS_CHILD_KEY: &str = "FWSCHILD";
+const FRAMEWORK_SHELLS_DISABLE_FWS_SOCKETIO_PEER_KEY: &str =
+    "FRAMEWORK_SHELLS_DISABLE_FWS_SOCKETIO_PEER";
 const MAX_EXITED_SHELLS: usize = 50;
 const DIRECT_OUTPUT_READ_CHUNK_BYTES: usize = 64 * 1024;
 const DIRECT_OUTPUT_MAX_DRAIN_CHUNKS: usize = 64;
@@ -279,6 +283,7 @@ pub struct FerrousNativeManager {
     reactor: NativeRuntimeReactor,
     store: FerrousNativeStore,
     native_env: FerrousNativeEnv,
+    parent_peer: Arc<Mutex<Option<crate::native_peer::FerrousNativePeer>>>,
 }
 
 #[derive(Clone)]
@@ -570,6 +575,21 @@ impl FerrousNativeManager {
     }
 
     pub fn with_store_and_env(store: FerrousNativeStore, native_env: FerrousNativeEnv) -> Self {
+        Self::with_store_and_env_options(store, native_env, true)
+    }
+
+    pub(crate) fn with_store_and_env_without_parent_peer(
+        store: FerrousNativeStore,
+        native_env: FerrousNativeEnv,
+    ) -> Self {
+        Self::with_store_and_env_options(store, native_env, false)
+    }
+
+    fn with_store_and_env_options(
+        store: FerrousNativeStore,
+        native_env: FerrousNativeEnv,
+        start_parent_peer: bool,
+    ) -> Self {
         let state = Arc::new(Mutex::new(ManagerState::default()));
         let subscriptions = Arc::new(Mutex::new(OutputSubscriptions::default()));
         let subscriber_count = Arc::new(AtomicU64::new(0));
@@ -581,7 +601,7 @@ impl FerrousNativeManager {
             Arc::clone(&subscriber_count),
             lifecycle_tx.clone(),
         );
-        Self {
+        let manager = Self {
             state,
             subscriptions,
             subscriber_count,
@@ -590,6 +610,45 @@ impl FerrousNativeManager {
             reactor,
             store,
             native_env,
+            parent_peer: Arc::new(Mutex::new(None)),
+        };
+        if start_parent_peer {
+            manager.start_parent_peer_if_requested();
+        }
+        manager
+    }
+
+    fn clone_without_parent_peer(&self) -> Self {
+        Self {
+            state: Arc::clone(&self.state),
+            subscriptions: Arc::clone(&self.subscriptions),
+            subscriber_count: Arc::clone(&self.subscriber_count),
+            async_outputs: Arc::clone(&self.async_outputs),
+            lifecycle_tx: self.lifecycle_tx.clone(),
+            reactor: self.reactor.clone(),
+            store: self.store.clone(),
+            native_env: self.native_env.clone(),
+            parent_peer: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn start_parent_peer_if_requested(&self) {
+        if !native_env_requests_parent_peer(&self.native_env) {
+            return;
+        }
+        if native_env_disables_parent_peer(&self.native_env) {
+            return;
+        }
+        let peer_manager = self.clone_without_parent_peer();
+        match crate::native_peer::FerrousNativePeer::connect_from_manager_env(peer_manager) {
+            Ok(peer) => {
+                if let Ok(mut parent_peer) = self.parent_peer.lock() {
+                    *parent_peer = Some(peer);
+                }
+            }
+            Err(error) => {
+                eprintln!("[ferrous-framework] fws parent peer connect failed: {error:#}");
+            }
         }
     }
 
@@ -2094,7 +2153,7 @@ impl FerrousNativeEnv {
             run_id: read_env_or_else(FRAMEWORK_SHELLS_RUN_ID_KEY, generate_run_id),
             fws_socketio_url: nonempty_env(FRAMEWORK_SHELLS_FWS_SOCKETIO_URL_KEY),
             te_framework_url: nonempty_env(TE_FRAMEWORK_URL_KEY),
-            extra: HashMap::new(),
+            extra: fws_child_extra_from_process_env(),
         }
     }
 
@@ -2116,7 +2175,7 @@ impl FerrousNativeEnv {
                 .filter(|value| !value.is_empty())
                 .cloned()
                 .or_else(|| nonempty_env(TE_FRAMEWORK_URL_KEY)),
-            extra: HashMap::new(),
+            extra: fws_child_extra_from_env_map(env_map),
         }
     }
 
@@ -2133,6 +2192,8 @@ impl FerrousNativeEnv {
         if let Some(url) = &self.te_framework_url {
             out.insert(TE_FRAMEWORK_URL_KEY.to_owned(), url.clone());
         }
+        out.entry(FRAMEWORK_SHELLS_FWS_CHILD_KEY.to_owned())
+            .or_insert_with(|| "1".to_owned());
         out
     }
 }
@@ -3304,10 +3365,60 @@ fn truthy_env(name: &str) -> bool {
     let Some(raw) = nonempty_env(name) else {
         return false;
     };
+    truthy_value(&raw)
+}
+
+fn truthy_value(raw: &str) -> bool {
     matches!(
         raw.trim().to_ascii_lowercase().as_str(),
         "1" | "true" | "yes" | "y" | "on"
     )
+}
+
+fn native_env_requests_parent_peer(native_env: &FerrousNativeEnv) -> bool {
+    env_flag_truthy(&native_env.extra, FRAMEWORK_SHELLS_FWS_CHILD_KEY)
+        || env_flag_truthy(&native_env.extra, LEGACY_FWS_CHILD_KEY)
+}
+
+fn native_env_disables_parent_peer(native_env: &FerrousNativeEnv) -> bool {
+    env_flag_truthy(
+        &native_env.extra,
+        FRAMEWORK_SHELLS_DISABLE_FWS_SOCKETIO_PEER_KEY,
+    )
+}
+
+fn env_flag_truthy(env: &HashMap<String, String>, name: &str) -> bool {
+    env.get(name).is_some_and(|value| truthy_value(value))
+}
+
+fn fws_child_extra_from_process_env() -> HashMap<String, String> {
+    let mut extra = HashMap::new();
+    if truthy_env(FRAMEWORK_SHELLS_FWS_CHILD_KEY) || truthy_env(LEGACY_FWS_CHILD_KEY) {
+        extra.insert(FRAMEWORK_SHELLS_FWS_CHILD_KEY.to_owned(), "1".to_owned());
+    }
+    if truthy_env(FRAMEWORK_SHELLS_DISABLE_FWS_SOCKETIO_PEER_KEY) {
+        extra.insert(
+            FRAMEWORK_SHELLS_DISABLE_FWS_SOCKETIO_PEER_KEY.to_owned(),
+            "1".to_owned(),
+        );
+    }
+    extra
+}
+
+fn fws_child_extra_from_env_map(env_map: &HashMap<String, String>) -> HashMap<String, String> {
+    let mut extra = fws_child_extra_from_process_env();
+    if env_flag_truthy(env_map, FRAMEWORK_SHELLS_FWS_CHILD_KEY)
+        || env_flag_truthy(env_map, LEGACY_FWS_CHILD_KEY)
+    {
+        extra.insert(FRAMEWORK_SHELLS_FWS_CHILD_KEY.to_owned(), "1".to_owned());
+    }
+    if env_flag_truthy(env_map, FRAMEWORK_SHELLS_DISABLE_FWS_SOCKETIO_PEER_KEY) {
+        extra.insert(
+            FRAMEWORK_SHELLS_DISABLE_FWS_SOCKETIO_PEER_KEY.to_owned(),
+            "1".to_owned(),
+        );
+    }
+    extra
 }
 
 fn nonempty_env(name: &str) -> Option<String> {
