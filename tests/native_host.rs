@@ -2,6 +2,11 @@ use ferrous_framework::{
     FerrousNativeEnv, FerrousNativeHost, FerrousNativeHostConfig, FerrousNativeManager,
     FerrousNativePeer, FerrousNativePeerConfig, FerrousNativePipeConfig, FerrousNativeProcConfig,
     FerrousNativeStore, derive_native_api_token,
+    peer_protocol::{
+        FWS_DASHBOARD_OPEN_METHOD, FWS_LOGS_CHUNK_METHOD, FWS_LOGS_OPEN_METHOD,
+        FWS_NOTIFICATION_EVENT, FWS_REQUEST_EVENT, FWS_SOCKETIO_NAMESPACE,
+        FWS_SOCKETIO_SOCKET_PATH,
+    },
 };
 use serde_json::{Value, json};
 use std::{
@@ -10,9 +15,11 @@ use std::{
     io::{Read, Write},
     net::{SocketAddr, TcpStream},
     path::PathBuf,
+    sync::mpsc::{self, Receiver},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use tf_rust_socketio::{ClientBuilder, Payload, TransportType, client::Client};
 
 fn test_log_dir(name: &str) -> PathBuf {
     let unique = SystemTime::now()
@@ -305,6 +312,148 @@ fn native_peer_relays_lifecycle_notifications_to_controller() {
     host.close_blocking().expect("close host");
 }
 
+#[test]
+fn native_dashboard_receives_local_shell_lifecycle_notifications() {
+    let manager = test_manager("local-dashboard-lifecycle");
+    let host =
+        FerrousNativeHost::spawn_with_manager(FerrousNativeHostConfig::default(), manager.clone())
+            .expect("spawn native host");
+    let (browser, notifications) = connect_dashboard_browser(&host);
+
+    let shell = manager
+        .spawn_proc_blocking(FerrousNativeProcConfig {
+            command: vec!["sh".into(), "-c".into(), "sleep 5".into()],
+            cwd: None,
+            env: HashMap::new(),
+            label: "local-dashboard-proc".into(),
+            spec_id: "local-dashboard-proc".into(),
+            subgroups: vec!["dashboard-tests".into()],
+            log_dir: None,
+        })
+        .expect("spawn local proc");
+
+    wait_for_shell_lifecycle_notification(&notifications, "fws.shell.spawned", &shell.id);
+    manager
+        .terminate_shell_strict_blocking(&shell.id, true)
+        .expect("terminate local proc");
+    wait_for_shell_lifecycle_notification(&notifications, "fws.shell.exited", &shell.id);
+
+    browser.disconnect().expect("disconnect browser");
+    host.close_blocking().expect("close host");
+}
+
+#[test]
+fn native_dashboard_receives_peer_shell_lifecycle_notifications() {
+    let secret = "ferrous-peer-dashboard-lifecycle-secret".to_owned();
+    let host_manager = test_manager_with_secret("peer-dashboard-controller", secret.clone());
+    let peer_manager = test_manager_with_secret("peer-dashboard-owner", secret.clone());
+    let host =
+        FerrousNativeHost::spawn_with_manager(FerrousNativeHostConfig::default(), host_manager)
+            .expect("spawn native host");
+    let addr = host.addr();
+    let peer = FerrousNativePeer::connect(
+        peer_manager.clone(),
+        FerrousNativePeerConfig::new(host.url()),
+    )
+    .expect("connect ferrous peer");
+    wait_for_peer_count(addr, 1);
+    let (browser, notifications) = connect_dashboard_browser(&host);
+
+    let shell = peer_manager
+        .spawn_proc_blocking(FerrousNativeProcConfig {
+            command: vec!["sh".into(), "-c".into(), "sleep 5".into()],
+            cwd: None,
+            env: HashMap::new(),
+            label: "peer-dashboard-proc".into(),
+            spec_id: "peer-dashboard-proc".into(),
+            subgroups: vec!["dashboard-tests".into()],
+            log_dir: None,
+        })
+        .expect("spawn peer proc");
+
+    wait_for_shell_lifecycle_notification(&notifications, "fws.shell.spawned", &shell.id);
+    peer_manager
+        .terminate_shell_strict_blocking(&shell.id, true)
+        .expect("terminate peer proc");
+    wait_for_shell_lifecycle_notification(&notifications, "fws.shell.exited", &shell.id);
+
+    browser.disconnect().expect("disconnect browser");
+    peer.disconnect().expect("disconnect peer");
+    host.close_blocking().expect("close host");
+}
+
+#[test]
+fn native_dashboard_receives_local_pipe_log_chunks() {
+    let manager = test_manager("local-dashboard-logs");
+    let host =
+        FerrousNativeHost::spawn_with_manager(FerrousNativeHostConfig::default(), manager.clone())
+            .expect("spawn native host");
+    let (browser, notifications) = connect_dashboard_browser(&host);
+
+    let shell = manager
+        .spawn_pipe_blocking(FerrousNativePipeConfig {
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "while IFS= read -r line; do printf 'dashboard-log:%s\\n' \"$line\"; done".into(),
+            ],
+            cwd: None,
+            env: HashMap::new(),
+            label: "local-dashboard-pipe".into(),
+            spec_id: "local-dashboard-pipe".into(),
+            subgroups: vec!["dashboard-tests".into()],
+            log_dir: None,
+        })
+        .expect("spawn local pipe");
+    open_shell_logs(&browser, &shell.id);
+
+    manager
+        .write_line_blocking(&shell.id, "probe")
+        .expect("write local pipe");
+    let line = manager
+        .read_line_blocking(&shell.id, Duration::from_secs(3))
+        .expect("read local pipe")
+        .expect("local pipe response");
+    assert!(line.contains("dashboard-log:probe"));
+    wait_for_log_chunk_notification(&notifications, &shell.id, "dashboard-log:probe");
+
+    browser.disconnect().expect("disconnect browser");
+    let _ = manager.terminate_shell_strict_blocking(&shell.id, true);
+    host.close_blocking().expect("close host");
+}
+
+#[test]
+fn native_dashboard_receives_local_proc_log_chunks() {
+    let manager = test_manager("local-dashboard-proc-logs");
+    let host =
+        FerrousNativeHost::spawn_with_manager(FerrousNativeHostConfig::default(), manager.clone())
+            .expect("spawn native host");
+    let (browser, notifications) = connect_dashboard_browser(&host);
+
+    let shell = manager
+        .spawn_proc_blocking(FerrousNativeProcConfig {
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "sleep 0.5; printf 'dashboard-proc-log\\n'; sleep 1".into(),
+            ],
+            cwd: None,
+            env: HashMap::new(),
+            label: "local-dashboard-proc-log".into(),
+            spec_id: "local-dashboard-proc-log".into(),
+            subgroups: vec!["dashboard-tests".into()],
+            log_dir: None,
+        })
+        .expect("spawn local proc");
+    open_shell_logs(&browser, &shell.id);
+
+    wait_for_log_chunk_notification(&notifications, &shell.id, "dashboard-proc-log");
+
+    browser.disconnect().expect("disconnect browser");
+    let _ = manager.terminate_shell_strict_blocking(&shell.id, true);
+    host.close_blocking().expect("close host");
+}
+
 fn wait_for_peer_count(addr: SocketAddr, expected: usize) {
     for _ in 0..50 {
         let (status, body) = request(addr, "GET", "/api/framework_shells/runtime", &[], "");
@@ -338,6 +487,155 @@ fn wait_for_peer_notifications(addr: SocketAddr, expected_at_least: u64) {
         thread::sleep(Duration::from_millis(20));
     }
     panic!("timed out waiting for peer_notifications_received >= {expected_at_least}");
+}
+
+fn connect_dashboard_browser(host: &FerrousNativeHost) -> (Client, Receiver<Value>) {
+    let (notification_tx, notification_rx) = mpsc::channel::<Value>();
+    let client = ClientBuilder::new(socketio_url(&host.url()))
+        .namespace(FWS_SOCKETIO_NAMESPACE)
+        .transport_type(TransportType::Websocket)
+        .auth(json!({ "role": "browser" }))
+        .on(FWS_NOTIFICATION_EVENT, move |payload, _socket| {
+            if let Some(value) = payload_value(&payload) {
+                let _ = notification_tx.send(value);
+            }
+        })
+        .connect()
+        .expect("connect dashboard browser");
+    thread::sleep(Duration::from_millis(100));
+    emit_dashboard_request(
+        &client,
+        FWS_DASHBOARD_OPEN_METHOD,
+        json!({ "view": "html" }),
+        "dashboard-open",
+    );
+    (client, notification_rx)
+}
+
+fn open_shell_logs(client: &Client, shell_id: &str) {
+    emit_dashboard_request(
+        client,
+        FWS_LOGS_OPEN_METHOD,
+        json!({ "shell_id": shell_id }),
+        "logs-open",
+    );
+}
+
+fn emit_dashboard_request(client: &Client, method: &str, params: Value, id: &str) {
+    let (ack_tx, ack_rx) = mpsc::channel::<Value>();
+    client
+        .emit_with_ack(
+            FWS_REQUEST_EVENT,
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": method,
+                "params": params
+            }),
+            Duration::from_secs(3),
+            move |payload, _socket| {
+                if let Some(value) = payload_value(&payload) {
+                    let _ = ack_tx.send(value);
+                }
+            },
+        )
+        .expect("emit dashboard request");
+    let ack = ack_rx
+        .recv_timeout(Duration::from_secs(3))
+        .unwrap_or_else(|error| panic!("{method} ack timeout: {error}"));
+    assert!(
+        ack.get("result").is_some() || ack.get("error").is_some(),
+        "unexpected {method} ack: {ack}"
+    );
+    assert!(
+        ack.get("error").is_none(),
+        "unexpected {method} error ack: {ack}"
+    );
+}
+
+fn wait_for_shell_lifecycle_notification(
+    notifications: &Receiver<Value>,
+    method: &str,
+    shell_id: &str,
+) -> Value {
+    wait_for_notification(notifications, |notification| {
+        notification.get("method").and_then(Value::as_str) == Some(method)
+            && notification
+                .get("params")
+                .and_then(Value::as_object)
+                .and_then(|params| params.get("shell"))
+                .and_then(Value::as_object)
+                .and_then(|shell| shell.get("id"))
+                .and_then(Value::as_str)
+                == Some(shell_id)
+    })
+}
+
+fn wait_for_log_chunk_notification(
+    notifications: &Receiver<Value>,
+    shell_id: &str,
+    expected_text: &str,
+) -> Value {
+    wait_for_notification(notifications, |notification| {
+        notification.get("method").and_then(Value::as_str) == Some(FWS_LOGS_CHUNK_METHOD)
+            && notification
+                .get("params")
+                .and_then(Value::as_object)
+                .and_then(|params| params.get("shell_id"))
+                .and_then(Value::as_str)
+                == Some(shell_id)
+            && notification
+                .get("params")
+                .and_then(Value::as_object)
+                .and_then(|params| params.get("chunk"))
+                .and_then(Value::as_str)
+                .is_some_and(|chunk| chunk.contains(expected_text))
+    })
+}
+
+fn wait_for_notification(
+    notifications: &Receiver<Value>,
+    mut predicate: impl FnMut(&Value) -> bool,
+) -> Value {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let timeout = remaining.min(Duration::from_millis(200));
+        match notifications.recv_timeout(timeout) {
+            Ok(notification) if predicate(&notification) => return notification,
+            Ok(_) => continue,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    panic!("timed out waiting for dashboard notification");
+}
+
+fn socketio_url(base_url: &str) -> String {
+    format!(
+        "{}{}",
+        base_url.trim_end_matches('/'),
+        FWS_SOCKETIO_SOCKET_PATH
+    )
+}
+
+fn payload_value(payload: &Payload) -> Option<Value> {
+    #[allow(deprecated)]
+    let value = match payload {
+        Payload::Text(values, _) => values.first().cloned(),
+        Payload::String(value, _) => serde_json::from_str(value).ok(),
+        Payload::Binary(_, _) => None,
+    }?;
+    Some(unwrap_socketio_payload_value(value))
+}
+
+fn unwrap_socketio_payload_value(value: Value) -> Value {
+    if let Some(values) = value.as_array()
+        && let Some(first) = values.first()
+    {
+        return first.clone();
+    }
+    value
 }
 
 fn request(

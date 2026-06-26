@@ -1,15 +1,17 @@
 use crate::native_runtime::{
     FerrousNativeLifecycleEvent, FerrousNativeLifecycleEventKind, FerrousNativeManager,
-    FerrousNativePipeConfig, FerrousNativeProcConfig, FerrousNativePtyConfig, FerrousNativePtyMode,
-    FerrousNativeShellRecord, FerrousNativeShellStatus, FerrousNativeStore,
+    FerrousNativeOutputChunk, FerrousNativeOutputStream, FerrousNativeOutputSubscription,
+    FerrousNativeOutputSubscriptionStopper, FerrousNativePipeConfig, FerrousNativeProcConfig,
+    FerrousNativePtyConfig, FerrousNativePtyMode, FerrousNativeShellRecord,
+    FerrousNativeShellStatus, FerrousNativeStore,
 };
 use crate::peer_protocol::{
     FWS_BROWSER_ROLE, FWS_DASHBOARD_OPEN_METHOD, FWS_DASHBOARD_REFRESH_METHOD, FWS_DASHBOARD_ROOM,
-    FWS_ERROR_METHOD, FWS_LOGS_CLOSE_METHOD, FWS_LOGS_INITIAL_METHOD, FWS_LOGS_OPEN_METHOD,
-    FWS_NOTIFICATION_EVENT, FWS_PEER_NOTIFICATION_EVENT, FWS_PEER_REQUEST_EVENT, FWS_PEER_ROLE,
-    FWS_PEER_ROOM, FWS_PEER_SUBSCRIPTIONS_EVENT, FWS_SHELL_INPUT_METHOD, FWS_SOCKETIO_NAMESPACE,
-    FWS_SOCKETIO_SOCKET_PATH, FwsJsonRpcNotification, FwsPeerShellInputRequest,
-    FwsPeerSubscriptions, shell_room,
+    FWS_ERROR_METHOD, FWS_LOGS_CHUNK_METHOD, FWS_LOGS_CLOSE_METHOD, FWS_LOGS_INITIAL_METHOD,
+    FWS_LOGS_OPEN_METHOD, FWS_NOTIFICATION_EVENT, FWS_PEER_NOTIFICATION_EVENT,
+    FWS_PEER_REQUEST_EVENT, FWS_PEER_ROLE, FWS_PEER_ROOM, FWS_PEER_SUBSCRIPTIONS_EVENT,
+    FWS_SHELL_INPUT_METHOD, FWS_SOCKETIO_NAMESPACE, FWS_SOCKETIO_SOCKET_PATH,
+    FwsJsonRpcNotification, FwsPeerShellInputRequest, FwsPeerSubscriptions, shell_room,
 };
 use crate::shellspec::ShellspecRenderInput;
 use anyhow::{Context, Result, anyhow};
@@ -47,6 +49,8 @@ use tokio::sync::oneshot;
 
 type HmacSha256 = Hmac<Sha256>;
 
+const LOCAL_OUTPUT_SUBSCRIPTION_CAPACITY: usize = 1024;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FerrousNativeHostConfig {
     pub host: String,
@@ -67,6 +71,7 @@ impl Default for FerrousNativeHostConfig {
 pub struct FerrousNativeHost {
     manager: FerrousNativeManager,
     addr: SocketAddr,
+    socketio_runtime: SocketIoRuntimeState,
     shutdown_tx: Option<oneshot::Sender<()>>,
     join: Option<JoinHandle<Result<()>>>,
 }
@@ -85,7 +90,11 @@ struct HostState {
 struct SocketIoRuntimeState {
     peer_sids: Arc<Mutex<HashSet<String>>>,
     browser_log_subscriptions: Arc<Mutex<HashMap<String, String>>>,
+    local_output_streams: Arc<
+        Mutex<HashMap<(String, FerrousNativeOutputStream), FerrousNativeOutputSubscriptionStopper>>,
+    >,
     peer_notifications_received: Arc<AtomicU64>,
+    closed: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -312,6 +321,7 @@ impl FerrousNativeHost {
     }
 
     pub fn shutdown(&mut self) -> Result<()> {
+        self.socketio_runtime.close();
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
@@ -331,19 +341,21 @@ impl FerrousNativeHost {
         listener
             .set_nonblocking(true)
             .context("failed to configure native host listener")?;
+        let socketio_runtime = SocketIoRuntimeState::default();
         let state = HostState {
             api_token: derive_api_token(&manager.native_env().secret),
             manager: manager.clone(),
             require_auth: config.require_auth,
             base_url: url_for_addr(addr),
             socketio: None,
-            socketio_runtime: SocketIoRuntimeState::default(),
+            socketio_runtime: socketio_runtime.clone(),
         };
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let join = thread::spawn(move || run_host_thread(listener, state, shutdown_rx));
         Ok(Self {
             manager,
             addr,
+            socketio_runtime,
             shutdown_tx: Some(shutdown_tx),
             join: Some(join),
         })
@@ -428,6 +440,19 @@ fn router(state: HostState) -> Router {
 }
 
 impl SocketIoRuntimeState {
+    fn close(&self) {
+        self.closed.store(1, Ordering::Relaxed);
+        if let Ok(mut active) = self.local_output_streams.lock() {
+            for (_, stopper) in active.drain() {
+                stopper.stop();
+            }
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Relaxed) != 0
+    }
+
     fn add_peer(&self, sid: String) {
         if let Ok(mut peers) = self.peer_sids.lock() {
             peers.insert(sid);
@@ -525,9 +550,137 @@ async fn emit_shell_lifecycle(io: &SocketIo, event: FerrousNativeLifecycleEvent)
         params: json!({ "shell": shell_payload(event.shell) }),
     };
     let _ = ns
-        .within(FWS_DASHBOARD_ROOM)
+        .to(FWS_DASHBOARD_ROOM)
         .emit(FWS_NOTIFICATION_EVENT, &notification)
         .await;
+}
+
+fn ensure_local_output_streams(io: &SocketIo, state: &HostState) {
+    let desired = desired_local_output_streams(&state.socketio_runtime);
+    if let Ok(mut active) = state.socketio_runtime.local_output_streams.lock() {
+        let stale = active
+            .keys()
+            .filter(|key| !desired.contains(*key))
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in stale {
+            if let Some(stopper) = active.remove(&key) {
+                stopper.stop();
+            }
+        }
+    }
+    for (shell_id, stream) in desired {
+        let key = (shell_id.clone(), stream);
+        let should_subscribe = {
+            let Ok(active) = state.socketio_runtime.local_output_streams.lock() else {
+                continue;
+            };
+            !active.contains_key(&key)
+        };
+        if !should_subscribe {
+            continue;
+        }
+        let subscription = match state.manager.subscribe_output(
+            &shell_id,
+            stream,
+            LOCAL_OUTPUT_SUBSCRIPTION_CAPACITY,
+        ) {
+            Ok(Some(subscription)) => subscription,
+            Ok(None) | Err(_) => {
+                if let Ok(mut active) = state.socketio_runtime.local_output_streams.lock() {
+                    active.remove(&key);
+                }
+                continue;
+            }
+        };
+        let stopper = subscription.stopper();
+        if let Ok(mut active) = state.socketio_runtime.local_output_streams.lock() {
+            active.insert(key.clone(), stopper);
+        }
+        spawn_local_output_stream_relay(
+            io.clone(),
+            subscription,
+            key,
+            Arc::clone(&state.socketio_runtime.local_output_streams),
+            state.socketio_runtime.clone(),
+        );
+    }
+}
+
+fn desired_local_output_streams(
+    runtime: &SocketIoRuntimeState,
+) -> HashSet<(String, FerrousNativeOutputStream)> {
+    runtime
+        .active_log_shell_ids()
+        .into_iter()
+        .flat_map(|shell_id| {
+            [
+                (shell_id.clone(), FerrousNativeOutputStream::Stdout),
+                (shell_id, FerrousNativeOutputStream::Stderr),
+            ]
+        })
+        .collect()
+}
+
+fn spawn_local_output_stream_relay(
+    io: SocketIo,
+    subscription: FerrousNativeOutputSubscription,
+    key: (String, FerrousNativeOutputStream),
+    active_streams: Arc<
+        Mutex<HashMap<(String, FerrousNativeOutputStream), FerrousNativeOutputSubscriptionStopper>>,
+    >,
+    runtime: SocketIoRuntimeState,
+) {
+    let handle = tokio::runtime::Handle::current();
+    thread::spawn(move || {
+        while !runtime.is_closed() {
+            let active = active_streams
+                .lock()
+                .map(|active| active.contains_key(&key))
+                .unwrap_or(false);
+            if !active {
+                break;
+            }
+            match subscription.recv() {
+                Ok(Some(chunk)) => {
+                    handle.block_on(emit_local_output_chunk(&io, chunk));
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+        if let Ok(mut active) = active_streams.lock()
+            && let Some(stopper) = active.remove(&key)
+        {
+            stopper.stop();
+        }
+    });
+}
+
+async fn emit_local_output_chunk(io: &SocketIo, chunk: FerrousNativeOutputChunk) {
+    let Some(ns) = io.of(FWS_SOCKETIO_NAMESPACE) else {
+        return;
+    };
+    let shell_id = chunk.shell_id;
+    let notification = FwsJsonRpcNotification {
+        jsonrpc: "2.0".to_owned(),
+        method: FWS_LOGS_CHUNK_METHOD.to_owned(),
+        params: json!({
+            "shell_id": shell_id,
+            "stream": output_stream_name(chunk.stream),
+            "chunk": String::from_utf8_lossy(&chunk.bytes).into_owned(),
+        }),
+    };
+    let _ = ns
+        .to(shell_room(&shell_id))
+        .emit(FWS_NOTIFICATION_EVENT, &notification)
+        .await;
+}
+
+fn output_stream_name(stream: FerrousNativeOutputStream) -> &'static str {
+    match stream {
+        FerrousNativeOutputStream::Stdout => "stdout",
+        FerrousNativeOutputStream::Stderr => "stderr",
+    }
 }
 
 async fn handle_fws_socketio_connect(socket: SocketRef, auth: Option<Value>, state: HostState) {
@@ -562,8 +715,11 @@ async fn handle_fws_socketio_connect(socket: SocketRef, auth: Option<Value>, sta
             state.socketio_runtime.remove_peer(&sid);
             let previous_shell_id = state.socketio_runtime.remove_browser(&sid);
             if let Some(shell_id) = previous_shell_id {
-                broadcast_peer_subscriptions(&state).await;
                 socket.leave(shell_room(&shell_id));
+                if let Some(io) = &state.socketio {
+                    ensure_local_output_streams(io, &state);
+                }
+                broadcast_peer_subscriptions(&state).await;
             }
         }
     });
@@ -974,6 +1130,9 @@ async fn set_browser_log_shell(socket: &SocketRef, state: &HostState, shell_id: 
     if let Some(shell_id) = shell_id {
         socket.join(shell_room(&shell_id));
     }
+    if let Some(io) = &state.socketio {
+        ensure_local_output_streams(io, state);
+    }
     broadcast_peer_subscriptions(state).await;
 }
 
@@ -1196,7 +1355,7 @@ async fn emit_shell_removed(state: &HostState, shell_id: &str) {
         params: json!({ "shell_id": shell_id }),
     };
     let _ = ns
-        .within(FWS_DASHBOARD_ROOM)
+        .to(FWS_DASHBOARD_ROOM)
         .emit(FWS_NOTIFICATION_EVENT, &notification)
         .await;
 }

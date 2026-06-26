@@ -4,6 +4,11 @@ use crate::shellspec::{
 };
 use crate::shutdown::{FerrousShutdownResult, FerrousShutdownStats};
 use anyhow::{Context, Result, anyhow, bail};
+use crossbeam_channel::{
+    Receiver as CrossbeamReceiver, Sender as CrossbeamSender,
+    TryRecvError as CrossbeamTryRecvError, TrySendError as CrossbeamTrySendError,
+    bounded as crossbeam_bounded,
+};
 use nix::{
     fcntl::{FcntlArg, OFlag, fcntl},
     libc,
@@ -27,10 +32,7 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
-        mpsc::{
-            Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError, channel,
-            sync_channel,
-        },
+        mpsc::{Receiver, Sender, TryRecvError, channel},
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -118,7 +120,14 @@ pub struct FerrousShellInputResult {
 }
 
 pub struct FerrousNativeOutputSubscription {
-    rx: Receiver<FerrousNativeOutputChunk>,
+    rx: CrossbeamReceiver<FerrousNativeOutputChunk>,
+    stop_tx: CrossbeamSender<()>,
+    stop_rx: CrossbeamReceiver<()>,
+}
+
+#[derive(Clone)]
+pub struct FerrousNativeOutputSubscriptionStopper {
+    stop_tx: CrossbeamSender<()>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -291,7 +300,7 @@ struct OutputSubscriptions {
 }
 
 struct OutputSubscriber {
-    tx: SyncSender<FerrousNativeOutputChunk>,
+    tx: CrossbeamSender<FerrousNativeOutputChunk>,
 }
 
 struct NativeShellEntry {
@@ -486,18 +495,50 @@ impl NativeRuntimeReactor {
 }
 
 impl FerrousNativeOutputSubscription {
+    pub fn stopper(&self) -> FerrousNativeOutputSubscriptionStopper {
+        FerrousNativeOutputSubscriptionStopper {
+            stop_tx: self.stop_tx.clone(),
+        }
+    }
+
+    pub fn recv(&self) -> Result<Option<FerrousNativeOutputChunk>> {
+        crossbeam_channel::select! {
+            recv(self.rx) -> chunk => match chunk {
+                Ok(chunk) => Ok(Some(chunk)),
+                Err(_) => Ok(None),
+            },
+            recv(self.stop_rx) -> _ => Ok(None),
+        }
+    }
+
     pub fn recv_timeout(&self, timeout: Duration) -> Result<Option<FerrousNativeOutputChunk>> {
-        match self.rx.recv_timeout(timeout) {
-            Ok(chunk) => Ok(Some(chunk)),
-            Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => Ok(None),
+        crossbeam_channel::select! {
+            recv(self.rx) -> chunk => match chunk {
+                Ok(chunk) => Ok(Some(chunk)),
+                Err(_) => Ok(None),
+            },
+            recv(self.stop_rx) -> _ => Ok(None),
+            default(timeout) => Ok(None),
         }
     }
 
     pub fn try_recv(&self) -> Result<Option<FerrousNativeOutputChunk>> {
+        match self.stop_rx.try_recv() {
+            Ok(()) | Err(CrossbeamTryRecvError::Disconnected) => return Ok(None),
+            Err(CrossbeamTryRecvError::Empty) => {}
+        }
         match self.rx.try_recv() {
             Ok(chunk) => Ok(Some(chunk)),
-            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => Ok(None),
+            Err(CrossbeamTryRecvError::Empty) | Err(CrossbeamTryRecvError::Disconnected) => {
+                Ok(None)
+            }
         }
+    }
+}
+
+impl FerrousNativeOutputSubscriptionStopper {
+    pub fn stop(&self) {
+        let _ = self.stop_tx.try_send(());
     }
 }
 
@@ -1430,7 +1471,8 @@ impl FerrousNativeManager {
                 );
             }
         }
-        let (tx, rx) = sync_channel(capacity);
+        let (tx, rx) = crossbeam_bounded(capacity);
+        let (stop_tx, stop_rx) = crossbeam_bounded(1);
         let mut subscriptions = self
             .subscriptions
             .lock()
@@ -1441,7 +1483,11 @@ impl FerrousNativeManager {
             .or_default()
             .push(OutputSubscriber { tx });
         self.subscriber_count.fetch_add(1, Ordering::Relaxed);
-        Ok(Some(FerrousNativeOutputSubscription { rx }))
+        Ok(Some(FerrousNativeOutputSubscription {
+            rx,
+            stop_tx,
+            stop_rx,
+        }))
     }
 
     pub fn send_stdin_eof_blocking(&self, shell_id: &str) -> Result<bool> {
@@ -3493,12 +3539,12 @@ fn broadcast_output_batch(
             };
             match subscriber.tx.try_send(chunk) {
                 Ok(()) => {}
-                Err(TrySendError::Full(_)) => {
+                Err(CrossbeamTrySendError::Full(_)) => {
                     dropped_count += 1;
                     keep = false;
                     break;
                 }
-                Err(TrySendError::Disconnected(_)) => {
+                Err(CrossbeamTrySendError::Disconnected(_)) => {
                     keep = false;
                     break;
                 }

@@ -2,7 +2,7 @@ use crate::native_host::derive_api_token;
 use crate::native_runtime::{
     FerrousNativeLifecycleEvent, FerrousNativeLifecycleEventKind, FerrousNativeManager,
     FerrousNativeOutputChunk, FerrousNativeOutputStream, FerrousNativeOutputSubscription,
-    FerrousNativeShellRecord, FerrousShellInputResult,
+    FerrousNativeOutputSubscriptionStopper, FerrousNativeShellRecord, FerrousShellInputResult,
 };
 use crate::peer_protocol::{
     FWS_LOGS_CHUNK_METHOD, FWS_PEER_NOTIFICATION_EVENT, FWS_PEER_REQUEST_EVENT,
@@ -14,21 +14,19 @@ use crate::peer_protocol::{
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     process,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, Sender},
     },
     thread::{self, JoinHandle},
-    time::Duration,
 };
 use tf_rust_socketio::{ClientBuilder, Payload, RawClient, TransportType, client::Client};
-use tokio::sync::broadcast::error::TryRecvError;
+use tokio::sync::{broadcast::error::RecvError, watch};
 
 const PEER_OUTPUT_SUBSCRIPTION_CAPACITY: usize = 1024;
-const PEER_RELAY_IDLE_SLEEP: Duration = Duration::from_millis(50);
-const PEER_RELAY_RECONCILE_INTERVAL: Duration = Duration::from_millis(200);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FerrousNativePeerConfig {
@@ -53,6 +51,8 @@ pub struct FerrousNativePeer {
     client: Client,
     subscriptions: Arc<Mutex<HashSet<String>>>,
     relay_shutdown: Arc<AtomicBool>,
+    relay_shutdown_tx: watch::Sender<bool>,
+    subscription_wake: Sender<()>,
     relay_threads: Vec<JoinHandle<()>>,
 }
 
@@ -60,6 +60,8 @@ impl FerrousNativePeer {
     pub fn connect(manager: FerrousNativeManager, config: FerrousNativePeerConfig) -> Result<Self> {
         let subscriptions = Arc::new(Mutex::new(HashSet::new()));
         let subscription_state = Arc::clone(&subscriptions);
+        let (subscription_tx, subscription_rx) = mpsc::channel::<()>();
+        let subscription_wake_for_event = subscription_tx.clone();
         let request_manager = manager.clone();
         let auth = FwsPeerAuth::new(
             derive_api_token(&manager.native_env().secret),
@@ -74,6 +76,7 @@ impl FerrousNativePeer {
             .auth(serde_json::to_value(auth)?)
             .on(FWS_PEER_SUBSCRIPTIONS_EVENT, move |payload, _socket| {
                 update_subscriptions(&subscription_state, payload);
+                let _ = subscription_wake_for_event.send(());
             })
             .on(FWS_PEER_REQUEST_EVENT, move |payload, socket| {
                 acknowledge_peer_request(&request_manager, payload, socket);
@@ -85,16 +88,22 @@ impl FerrousNativePeer {
             .connect()
             .with_context(|| format!("failed to connect FWS peer to {}", config.controller_url))?;
         let relay_shutdown = Arc::new(AtomicBool::new(false));
+        let (relay_shutdown_tx, relay_shutdown_rx) = watch::channel(false);
         let relay_threads = start_relay_workers(
             manager,
             client.clone(),
             Arc::clone(&subscriptions),
             Arc::clone(&relay_shutdown),
+            relay_shutdown_rx,
+            subscription_rx,
         );
+        let _ = subscription_tx.send(());
         Ok(Self {
             client,
             subscriptions,
             relay_shutdown,
+            relay_shutdown_tx,
+            subscription_wake: subscription_tx,
             relay_threads,
         })
     }
@@ -138,6 +147,8 @@ impl FerrousNativePeer {
 
     pub fn disconnect(&self) -> Result<()> {
         self.relay_shutdown.store(true, Ordering::Relaxed);
+        let _ = self.relay_shutdown_tx.send(true);
+        let _ = self.subscription_wake.send(());
         self.client
             .disconnect()
             .map_err(|error| anyhow!("failed to disconnect FWS peer: {error}"))
@@ -147,6 +158,8 @@ impl FerrousNativePeer {
 impl Drop for FerrousNativePeer {
     fn drop(&mut self) {
         self.relay_shutdown.store(true, Ordering::Relaxed);
+        let _ = self.relay_shutdown_tx.send(true);
+        let _ = self.subscription_wake.send(());
         let _ = self.client.disconnect();
         for thread in self.relay_threads.drain(..) {
             let _ = thread.join();
@@ -159,31 +172,62 @@ fn start_relay_workers(
     client: Client,
     subscriptions: Arc<Mutex<HashSet<String>>>,
     shutdown: Arc<AtomicBool>,
+    lifecycle_shutdown: watch::Receiver<bool>,
+    subscription_rx: Receiver<()>,
 ) -> Vec<JoinHandle<()>> {
-    vec![
-        start_lifecycle_relay(manager.clone(), client.clone(), Arc::clone(&shutdown)),
-        start_output_relay(manager, client, subscriptions, shutdown),
-    ]
+    let mut threads = start_lifecycle_relay(manager.clone(), client.clone(), lifecycle_shutdown);
+    threads.push(start_output_relay(
+        manager,
+        client,
+        subscriptions,
+        shutdown,
+        subscription_rx,
+    ));
+    threads
 }
 
 fn start_lifecycle_relay(
     manager: FerrousNativeManager,
     client: Client,
-    shutdown: Arc<AtomicBool>,
-) -> JoinHandle<()> {
-    thread::spawn(move || {
+    mut shutdown: watch::Receiver<bool>,
+) -> Vec<JoinHandle<()>> {
+    let (notification_tx, notification_rx) = mpsc::channel::<FwsJsonRpcNotification>();
+    let event_thread = thread::spawn(move || {
         let mut events = manager.subscribe_lifecycle();
-        while !shutdown.load(Ordering::Relaxed) {
-            match events.try_recv() {
-                Ok(event) => {
-                    let _ = emit_peer_notification(&client, lifecycle_notification(event));
+        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        runtime.block_on(async move {
+            loop {
+                if *shutdown.borrow() {
+                    break;
                 }
-                Err(TryRecvError::Empty) => thread::sleep(PEER_RELAY_IDLE_SLEEP),
-                Err(TryRecvError::Lagged(_)) => continue,
-                Err(TryRecvError::Closed) => break,
+                tokio::select! {
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            break;
+                        }
+                    }
+                    event = events.recv() => match event {
+                        Ok(event) => {
+                            let _ = notification_tx.send(lifecycle_notification(event));
+                        }
+                        Err(RecvError::Lagged(_)) => continue,
+                        Err(RecvError::Closed) => break,
+                    }
+                }
             }
+        });
+    });
+    let emit_thread = thread::spawn(move || {
+        while let Ok(notification) = notification_rx.recv() {
+            let _ = emit_peer_notification(&client, notification);
         }
-    })
+    });
+    vec![event_thread, emit_thread]
 }
 
 fn start_output_relay(
@@ -191,44 +235,87 @@ fn start_output_relay(
     client: Client,
     subscriptions: Arc<Mutex<HashSet<String>>>,
     shutdown: Arc<AtomicBool>,
+    subscription_rx: Receiver<()>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
-        let active_streams = Arc::new(Mutex::new(
-            HashSet::<(String, FerrousNativeOutputStream)>::new(),
-        ));
-        while !shutdown.load(Ordering::Relaxed) {
-            let desired = desired_output_streams(&subscriptions);
-            if let Ok(mut active) = active_streams.lock() {
-                active.retain(|key| desired.contains(key));
+        let active_streams = Arc::new(Mutex::new(HashMap::<
+            (String, FerrousNativeOutputStream),
+            FerrousNativeOutputSubscriptionStopper,
+        >::new()));
+        loop {
+            if shutdown.load(Ordering::Relaxed) {
+                break;
             }
-            for (shell_id, stream) in desired {
-                let key = (shell_id.clone(), stream);
-                let already_active = active_streams
-                    .lock()
-                    .map(|active| active.contains(&key))
-                    .unwrap_or(true);
-                if already_active {
-                    continue;
-                }
-                let Ok(Some(subscription)) =
-                    manager.subscribe_output(&shell_id, stream, PEER_OUTPUT_SUBSCRIPTION_CAPACITY)
-                else {
-                    continue;
-                };
-                if let Ok(mut active) = active_streams.lock() {
-                    active.insert(key.clone());
-                }
-                spawn_output_stream_relay(
-                    client.clone(),
-                    subscription,
-                    key,
-                    Arc::clone(&active_streams),
-                    Arc::clone(&shutdown),
-                );
+            if subscription_rx.recv().is_err() {
+                break;
             }
-            thread::sleep(PEER_RELAY_RECONCILE_INTERVAL);
+            if shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+            ensure_peer_output_streams(
+                &manager,
+                &client,
+                &subscriptions,
+                Arc::clone(&active_streams),
+                Arc::clone(&shutdown),
+            );
+        }
+        if let Ok(mut active) = active_streams.lock() {
+            for (_, stopper) in active.drain() {
+                stopper.stop();
+            }
         }
     })
+}
+
+fn ensure_peer_output_streams(
+    manager: &FerrousNativeManager,
+    client: &Client,
+    subscriptions: &Arc<Mutex<HashSet<String>>>,
+    active_streams: Arc<
+        Mutex<HashMap<(String, FerrousNativeOutputStream), FerrousNativeOutputSubscriptionStopper>>,
+    >,
+    shutdown: Arc<AtomicBool>,
+) {
+    let desired = desired_output_streams(subscriptions);
+    if let Ok(mut active) = active_streams.lock() {
+        let stale = active
+            .keys()
+            .filter(|key| !desired.contains(*key))
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in stale {
+            if let Some(stopper) = active.remove(&key) {
+                stopper.stop();
+            }
+        }
+    }
+    for (shell_id, stream) in desired {
+        let key = (shell_id.clone(), stream);
+        let already_active = active_streams
+            .lock()
+            .map(|active| active.contains_key(&key))
+            .unwrap_or(true);
+        if already_active {
+            continue;
+        }
+        let Ok(Some(subscription)) =
+            manager.subscribe_output(&shell_id, stream, PEER_OUTPUT_SUBSCRIPTION_CAPACITY)
+        else {
+            continue;
+        };
+        let stopper = subscription.stopper();
+        if let Ok(mut active) = active_streams.lock() {
+            active.insert(key.clone(), stopper);
+        }
+        spawn_output_stream_relay(
+            client.clone(),
+            subscription,
+            key,
+            Arc::clone(&active_streams),
+            Arc::clone(&shutdown),
+        );
+    }
 }
 
 fn desired_output_streams(
@@ -252,26 +339,31 @@ fn spawn_output_stream_relay(
     client: Client,
     subscription: FerrousNativeOutputSubscription,
     key: (String, FerrousNativeOutputStream),
-    active_streams: Arc<Mutex<HashSet<(String, FerrousNativeOutputStream)>>>,
+    active_streams: Arc<
+        Mutex<HashMap<(String, FerrousNativeOutputStream), FerrousNativeOutputSubscriptionStopper>>,
+    >,
     shutdown: Arc<AtomicBool>,
 ) {
     thread::spawn(move || {
-        while !shutdown.load(Ordering::Relaxed)
-            && active_streams
+        while !shutdown.load(Ordering::Relaxed) {
+            let active = active_streams
                 .lock()
-                .map(|active| active.contains(&key))
-                .unwrap_or(false)
-        {
-            match subscription.recv_timeout(PEER_RELAY_RECONCILE_INTERVAL) {
+                .map(|active| active.contains_key(&key))
+                .unwrap_or(false);
+            if !active {
+                break;
+            }
+            match subscription.recv() {
                 Ok(Some(chunk)) => {
                     let _ = emit_peer_notification(&client, output_chunk_notification(chunk));
                 }
-                Ok(None) => {}
-                Err(_) => break,
+                Ok(None) | Err(_) => break,
             }
         }
-        if let Ok(mut active) = active_streams.lock() {
-            active.remove(&key);
+        if let Ok(mut active) = active_streams.lock()
+            && let Some(stopper) = active.remove(&key)
+        {
+            stopper.stop();
         }
     });
 }

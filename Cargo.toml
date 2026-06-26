@@ -1,6 +1,6 @@
 [package]
 name = "ferrous_framework"
-version = "0.2.10"
+version = "0.2.11"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/mrsurge/ferrous-framework"
@@ -10,6 +10,7 @@ description = "Rust runtime path for framework-shells-compatible process managem
 [dependencies]
 anyhow = "1"
 axum = "0.8"
+crossbeam-channel = "0.5"
 futures-util = "0.3"
 getrandom = "0.3"
 hmac = "0.12"
