@@ -1250,13 +1250,13 @@ fn shutdown_tree_with_empty_roots_terminates_all_live_roots() {
     let manager = FerrousNativeManager::new();
     let first = manager
         .spawn_proc_blocking(base_proc_config(
-            vec!["sh".to_owned(), "-c".to_owned(), "sleep 30".to_owned()],
+            vec!["sleep".to_owned(), "30".to_owned()],
             test_log_dir("shutdown-tree-all-first"),
         ))
         .expect("spawn first proc");
     let second = manager
         .spawn_proc_blocking(base_proc_config(
-            vec!["sh".to_owned(), "-c".to_owned(), "sleep 30".to_owned()],
+            vec!["sleep".to_owned(), "30".to_owned()],
             test_log_dir("shutdown-tree-all-second"),
         ))
         .expect("spawn second proc");
@@ -1351,13 +1351,13 @@ fn shutdown_tree_with_roots_only_terminates_matching_live_roots() {
     let manager = FerrousNativeManager::new();
     let selected = manager
         .spawn_proc_blocking(base_proc_config(
-            vec!["sh".to_owned(), "-c".to_owned(), "sleep 30".to_owned()],
+            vec!["sleep".to_owned(), "30".to_owned()],
             test_log_dir("shutdown-tree-selected"),
         ))
         .expect("spawn selected proc");
     let untouched = manager
         .spawn_proc_blocking(base_proc_config(
-            vec!["sh".to_owned(), "-c".to_owned(), "sleep 30".to_owned()],
+            vec!["sleep".to_owned(), "30".to_owned()],
             test_log_dir("shutdown-tree-untouched"),
         ))
         .expect("spawn untouched proc");

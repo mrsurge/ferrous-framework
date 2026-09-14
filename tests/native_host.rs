@@ -207,7 +207,7 @@ fn native_host_exposes_framework_shutdown_route() {
 
     let create = json!({
         "backend": "proc",
-        "command": ["sh", "-c", "sleep 30"],
+        "command": ["sleep", "30"],
         "label": "shutdown-route-proc",
         "spec_id": "shutdown-route-proc",
         "subgroups": ["shutdown-route-tests"]
