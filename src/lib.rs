@@ -1,4 +1,5 @@
 pub mod native_host;
+pub mod log_projection;
 pub mod native_peer;
 pub mod native_runtime;
 pub mod peer_protocol;
