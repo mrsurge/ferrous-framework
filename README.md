@@ -297,10 +297,13 @@ Fresh managers can load persisted records from the canonical metadata directory.
 
 ### Bounded Views And Stream Codecs
 
-The shared FWS dashboard reads bounded source-line windows, with Older/Newer/Live
-tail navigation. Existing live events trigger window reads without polling.
-Paused/history views do not accumulate incoming output; raw log files remain
-unchanged. Original bytes are available in pages of at most 64 KiB.
+The shared FWS dashboard keeps a sliding window of up to 200 source records.
+Scroll near an edge to fetch another slice while retaining overlap and your
+reading position. Scrolling away detaches live following; Jump to live restores
+the newest window. Existing events signal new output without polling or retaining
+hidden history. Tall previews scroll within bounded rows. Raw logs are unchanged;
+original bytes remain available through the raw API in pages of at most 64 KiB,
+not as dashboard hex controls.
 
 Shellspecs can declare `log_codecs: {stdout: messagepack, stderr: text}`.
 The supported values are `text` (default), `json`, and `messagepack`, with normal

@@ -255,10 +255,10 @@ fn projection_action() -> crate::log_projection::WindowAction {
     crate::log_projection::WindowAction::Tail
 }
 fn projection_count() -> usize {
-    1000
+    200
 }
 fn projection_shift() -> usize {
-    250
+    50
 }
 fn projection_limit() -> usize {
     65536
@@ -2041,3 +2041,15 @@ const FWS_CSS: &str = include_str!("../assets/fws_ui/fws.css");
 const FWS_JS: &str = include_str!("../assets/fws_ui/fws.js");
 const FWS_LOGS_HTML: &str = include_str!("../assets/fws_ui/logs.html");
 const SOCKET_IO_CLIENT_JS: &[u8] = include_bytes!("../assets/vendor/socket.io.min.js");
+
+#[cfg(test)]
+mod projection_defaults_tests {
+    use super::*;
+
+    #[test]
+    fn default_viewport_is_200_records_shifted_by_50() {
+        let query: WindowQuery = serde_urlencoded::from_str("").unwrap();
+        assert_eq!(query.count, 200);
+        assert_eq!(query.shift, 50);
+    }
+}
