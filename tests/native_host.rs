@@ -39,6 +39,102 @@ fn test_manager(name: &str) -> FerrousNativeManager {
     test_manager_with_secret(name, format!("host-secret-{name}"))
 }
 
+#[test]
+fn projection_host_reads_persisted_codec_and_raw_pages() {
+    let manager = test_manager("projection-window");
+    let store = manager.store();
+    let shell_id = "frs_projection_test";
+    let stdout = store.logs_dir.join(format!("{shell_id}.stdout.log"));
+    let stderr = store.logs_dir.join(format!("{shell_id}.stderr.log"));
+    let frame = [0x81, 0xa2, b'i', b'd', 7];
+    fs::write(&stdout, [frame, frame].concat()).unwrap();
+    fs::write(&stderr, b"diagnostic\n").unwrap();
+    let record_path = store.metadata_dir.join(shell_id).join("meta.json");
+    fs::create_dir_all(record_path.parent().unwrap()).unwrap();
+    fs::write(
+        &record_path,
+        serde_json::to_vec(&json!({
+            "id": shell_id, "backend": "pipe", "status": "exited",
+            "stdout_log": stdout, "stderr_log": stderr, "record_path": record_path,
+            "log_codecs": {"stdout":"messagepack", "stderr":"text"}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let record = manager.get_shell(shell_id).unwrap().unwrap();
+    assert_eq!(record.log_codecs["stdout"], "messagepack");
+    let host =
+        FerrousNativeHost::spawn_with_manager(FerrousNativeHostConfig::default(), manager.clone())
+            .unwrap();
+    let (status, body) = request(
+        host.addr(),
+        "GET",
+        &format!("/api/framework_shells/logs/{shell_id}/window?count=1"),
+        &[],
+        "",
+    );
+    assert_eq!(status, 200, "{body}");
+    let payload = json_body(&body);
+    let data = &payload["data"];
+    assert_eq!(data["total"], 2);
+    assert_eq!(data["start"], 1);
+    assert_eq!(data["records"][0]["text"], "{\"id\":7}");
+    let generation = data["generation"].as_str().unwrap();
+    let raw_url = format!(
+        "/api/framework_shells/logs/{shell_id}/raw?generation={generation}&byte_start=5&byte_end=10&limit=2"
+    );
+    let (status, body) = request(host.addr(), "GET", &raw_url, &[], "");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        json_body(&body)["data"],
+        json!({"hex":"81a2", "next_offset":2, "eof":false})
+    );
+    ferrous_framework::log_window::mark_log_reset(&stdout).unwrap();
+    let (status, _) = request(host.addr(), "GET", &raw_url, &[], "");
+    assert_eq!(status, 409);
+    assert_eq!(fs::read(stdout).unwrap(), [frame, frame].concat());
+    host.close_blocking().unwrap();
+}
+
+#[test]
+fn projection_codec_follows_shellspec_launch_and_reload() {
+    let manager = test_manager("projection-launch");
+    let document = json!({"shells":{"worker":{
+        "backend":"proc", "command":["sh", "-c", "printf '\\201\\242id\\007'"],
+        "log_codecs":{"stdout":"${ctx:CODEC}", "stderr":"text"}
+    }}});
+    let input = ferrous_framework::shellspec::ShellspecRenderInput {
+        ctx: HashMap::from([("CODEC".to_owned(), "messagepack".to_owned())]),
+        env: HashMap::new(),
+    };
+    let record = manager
+        .spawn_shellspec_entry_blocking(&document, "worker", &input)
+        .unwrap();
+    let exited = manager
+        .wait_shell_blocking(&record.id, Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        exited.status,
+        ferrous_framework::FerrousNativeShellStatus::Exited
+    );
+    assert_eq!(exited.log_codecs["stdout"], "messagepack");
+    let window = manager
+        .log_window_blocking(
+            &record.id,
+            "stdout",
+            ferrous_framework::log_projection::WindowAction::Tail,
+            0,
+            10,
+            1,
+            None,
+        )
+        .unwrap();
+    assert_eq!(window.records[0].text, "{\"id\":7}");
+    let persisted: Value = serde_json::from_slice(&fs::read(&record.record_path).unwrap()).unwrap();
+    assert_eq!(persisted["log_codecs"]["stdout"], "messagepack");
+}
+
 fn test_manager_with_secret(name: &str, secret: String) -> FerrousNativeManager {
     let store = FerrousNativeStore::from_base_dir_fingerprint_secret(
         test_log_dir(name).join("fws-base"),

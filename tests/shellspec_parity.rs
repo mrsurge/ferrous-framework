@@ -64,6 +64,9 @@ fn normalize_rendered_shell(case: &Value) -> Value {
     if let Some(value) = shell.get("pipe") {
         out.insert("pipe".to_owned(), value.clone());
     }
+    if let Some(value) = shell.get("log_codecs") {
+        out.insert("log_codecs".to_owned(), value.clone());
+    }
     if let Some(value) = shell.get("readiness") {
         let mut readiness = object(value).clone();
         if let Some(port) = readiness.get("port").and_then(Value::as_str) {

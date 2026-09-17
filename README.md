@@ -295,6 +295,24 @@ Fresh managers can load persisted records from the canonical metadata directory.
 
 `io_metadata_log` is currently a stable sidecar path declaration. It is not proof that Ferrous is writing I/O metadata sidecar records yet.
 
+### Bounded Views And Stream Codecs
+
+The shared FWS dashboard reads bounded source-line windows, with Older/Newer/Live
+tail navigation. Existing live events trigger window reads without polling.
+Paused/history views do not accumulate incoming output; raw log files remain
+unchanged. Original bytes are available in pages of at most 64 KiB.
+
+Shellspecs can declare `log_codecs: {stdout: messagepack, stderr: text}`.
+The supported values are `text` (default), `json`, and `messagepack`, with normal
+ctx/env template rendering. MessagePack observation indexes concatenated complete
+objects. It does not change child stdio or Socket.IO serialization. Codec metadata
+is persisted and shared with Python FWS, whose `fws inspect` decodes it too.
+
+Native manager APIs are `log_window_blocking` and `log_raw_blocking`; hosts expose
+`/api/framework_shells/logs/{shell_id}/window` and `/raw` on blocking I/O executors.
+See [the projection plan](docs/LOG_PROJECTION_PLAN.md) for budgets and remaining
+acceptance work, including display-window filtering and historical ANSI state.
+
 ## Tests And Benchmarks
 
 Default correctness checks:

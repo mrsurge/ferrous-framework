@@ -154,6 +154,7 @@ struct ShellPayload {
     autostart: bool,
     ui: Value,
     debug: Value,
+    log_codecs: Value,
     runtime_id: Option<String>,
     app_id: Option<String>,
     parent_shell_id: Option<String>,
@@ -231,6 +232,49 @@ struct TailQuery {
     bytes: usize,
     #[serde(default = "default_drain_timeout_ms")]
     drain_timeout_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct WindowQuery {
+    #[serde(default = "projection_stream")]
+    stream: String,
+    #[serde(default = "projection_action")]
+    action: crate::log_projection::WindowAction,
+    #[serde(default)]
+    current: usize,
+    #[serde(default = "projection_count")]
+    count: usize,
+    #[serde(default = "projection_shift")]
+    shift: usize,
+    generation: Option<String>,
+}
+fn projection_stream() -> String {
+    "stdout".to_owned()
+}
+fn projection_action() -> crate::log_projection::WindowAction {
+    crate::log_projection::WindowAction::Tail
+}
+fn projection_count() -> usize {
+    1000
+}
+fn projection_shift() -> usize {
+    250
+}
+fn projection_limit() -> usize {
+    65536
+}
+
+#[derive(Debug, Deserialize)]
+struct RawQuery {
+    #[serde(default = "projection_stream")]
+    stream: String,
+    generation: String,
+    byte_start: u64,
+    byte_end: u64,
+    #[serde(default)]
+    offset: u64,
+    #[serde(default = "projection_limit")]
+    limit: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -437,6 +481,11 @@ fn router(state: HostState) -> Router {
         )
         .route("/api/framework_shells/shutdown", post(shutdown_tree))
         .route("/api/framework_shells/logs/{shell_id}/tail", get(log_tail))
+        .route(
+            "/api/framework_shells/logs/{shell_id}/window",
+            get(log_window),
+        )
+        .route("/api/framework_shells/logs/{shell_id}/raw", get(log_raw))
         .with_state(state)
 }
 
@@ -837,6 +886,14 @@ async fn handle_browser_request(socket: SocketRef, request: Value, state: HostSt
                     None,
                 );
             };
+            if params
+                .and_then(|p| p.get("projection"))
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                set_browser_log_shell(&socket, &state, Some(shell_id.clone())).await;
+                return json!({"jsonrpc": "2.0", "id": request_id, "result": {"accepted": true, "shell_id": shell_id}});
+            }
             if let Err(error) = emit_logs_initial(&socket, &state, &shell_id).await {
                 return jsonrpc_error(
                     request_id,
@@ -1304,6 +1361,8 @@ fn truncate_all_logs(state: &HostState) -> Result<()> {
     for record in state.manager.list_shells()? {
         truncate_log_file(&record.stdout_log)?;
         truncate_log_file(&record.stderr_log)?;
+        state.manager.invalidate_log_index(&record.stdout_log)?;
+        state.manager.invalidate_log_index(&record.stderr_log)?;
     }
     Ok(())
 }
@@ -1315,6 +1374,7 @@ fn truncate_log_file(path: &PathBuf) -> Result<()> {
         .truncate(true)
         .open(path)
         .with_context(|| format!("failed to truncate log {}", path.display()))?;
+    crate::log_window::mark_log_reset(path)?;
     Ok(())
 }
 
@@ -1342,6 +1402,8 @@ fn purge_shell_record(state: &HostState, shell_id: &str) -> Result<()> {
 fn purge_record_files(record: &FerrousNativeShellRecord) -> Result<()> {
     remove_file_if_exists(&record.stdout_log)?;
     remove_file_if_exists(&record.stderr_log)?;
+    remove_file_if_exists(&crate::log_window::reset_path(&record.stdout_log))?;
+    remove_file_if_exists(&crate::log_window::reset_path(&record.stderr_log))?;
     if let Some(path) = &record.io_metadata_log {
         remove_file_if_exists(path)?;
     }
@@ -1438,10 +1500,9 @@ async fn dashboard_index() -> Response {
 }
 
 async fn legacy_logs_page(Path(shell_id): Path<String>) -> Response {
-    no_store_response(
-        "text/html; charset=utf-8",
-        FWS_LOGS_HTML.replace("{{ shell_id }}", &shell_id),
-    )
+    let query =
+        serde_urlencoded::to_string([("log", shell_id)]).expect("string query serialization");
+    Redirect::temporary(&format!("/fws/?{query}")).into_response()
 }
 
 async fn fws_static(Path(path): Path<String>) -> Result<Response, ApiError> {
@@ -1674,6 +1735,72 @@ async fn shell_input(
     Ok(ok_json(result))
 }
 
+fn projection_error(error: anyhow::Error) -> ApiError {
+    let message = error.to_string();
+    if message.contains("stale") || message.contains("changed") {
+        conflict_error(error)
+    } else if message.contains("Shell not found")
+        || error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+    {
+        not_found("Shell or log not found")
+    } else {
+        bad_request(message)
+    }
+}
+
+async fn log_window(
+    State(state): State<HostState>,
+    Path(shell_id): Path<String>,
+    Query(query): Query<WindowQuery>,
+) -> Result<Json<ApiEnvelope<crate::log_window::LogWindow>>, ApiError> {
+    let result = tokio::task::spawn_blocking(move || {
+        state.manager.log_window_blocking(
+            &shell_id,
+            &query.stream,
+            query.action,
+            query.current,
+            query.count,
+            query.shift,
+            query.generation.as_deref(),
+        )
+    })
+    .await
+    .map_err(|e| internal_error(e.into()))?
+    .map_err(projection_error)?;
+    Ok(ok_json(result))
+}
+
+async fn log_raw(
+    State(state): State<HostState>,
+    Path(shell_id): Path<String>,
+    Query(query): Query<RawQuery>,
+) -> Result<Json<ApiEnvelope<Value>>, ApiError> {
+    let result = tokio::task::spawn_blocking(move || -> Result<Value> {
+        let reference = crate::log_projection::RawReference {
+            generation: query.generation,
+            byte_start: query.byte_start,
+            byte_end: query.byte_end,
+        };
+        let data = state.manager.log_raw_blocking(
+            &shell_id,
+            &query.stream,
+            &reference,
+            query.offset,
+            query.limit,
+        )?;
+        let size = query.byte_end - query.byte_start;
+        let next_offset = query.offset.saturating_add(data.len() as u64).min(size);
+        let hex: String = data.iter().map(|b| format!("{b:02x}")).collect();
+        Ok(json!({"hex": hex, "next_offset": next_offset, "eof": next_offset >= size}))
+    })
+    .await
+    .map_err(|e| internal_error(e.into()))?
+    .map_err(projection_error)?;
+    Ok(ok_json(result))
+}
+
 async fn log_tail(
     State(state): State<HostState>,
     Path(shell_id): Path<String>,
@@ -1775,6 +1902,7 @@ fn shell_payload(record: FerrousNativeShellRecord) -> ShellPayload {
         autostart: record.autostart,
         ui: Value::Object(record.ui),
         debug: Value::Object(record.debug),
+        log_codecs: Value::Object(record.log_codecs),
         runtime_id: record.runtime_id,
         app_id: record.app_id,
         parent_shell_id: record.parent_shell_id,

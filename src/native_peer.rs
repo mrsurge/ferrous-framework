@@ -567,6 +567,7 @@ fn shell_payload_value(record: FerrousNativeShellRecord) -> Value {
         "autostart": record.autostart,
         "ui": Value::Object(record.ui),
         "debug": Value::Object(record.debug),
+        "log_codecs": Value::Object(record.log_codecs),
         "runtime_id": record.runtime_id,
         "app_id": record.app_id,
         "parent_shell_id": record.parent_shell_id,

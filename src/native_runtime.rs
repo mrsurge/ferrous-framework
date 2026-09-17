@@ -179,6 +179,7 @@ pub struct FerrousNativeShellRecord {
     pub autostart: bool,
     pub ui: Map<String, Value>,
     pub debug: Map<String, Value>,
+    pub log_codecs: Map<String, Value>,
     pub runtime_id: Option<String>,
     pub app_id: Option<String>,
     pub parent_shell_id: Option<String>,
@@ -284,6 +285,7 @@ pub struct FerrousNativeManager {
     store: FerrousNativeStore,
     native_env: FerrousNativeEnv,
     parent_peer: Arc<Mutex<Option<crate::native_peer::FerrousNativePeer>>>,
+    log_indexes: Arc<Mutex<crate::log_window::IndexCache>>,
 }
 
 #[derive(Clone)]
@@ -322,6 +324,7 @@ struct SpawnRecordMetadata {
     env_overrides: HashMap<String, String>,
     ui: Map<String, Value>,
     debug: Map<String, Value>,
+    log_codecs: Map<String, Value>,
     parent_shell_id: Option<String>,
 }
 
@@ -362,6 +365,8 @@ struct PersistedNativeShellRecord {
     ui: Map<String, Value>,
     #[serde(default)]
     debug: Map<String, Value>,
+    #[serde(default)]
+    log_codecs: Map<String, Value>,
     #[serde(default)]
     created_at_ms: u128,
     #[serde(default)]
@@ -548,6 +553,71 @@ impl FerrousNativeOutputSubscriptionStopper {
 }
 
 impl FerrousNativeManager {
+    pub fn log_window_blocking(
+        &self,
+        shell_id: &str,
+        stream: &str,
+        action: crate::log_projection::WindowAction,
+        current: usize,
+        count: usize,
+        shift: usize,
+        generation: Option<&str>,
+    ) -> Result<crate::log_window::LogWindow> {
+        let record = self
+            .get_shell(shell_id)?
+            .ok_or_else(|| anyhow!("Shell not found: {shell_id}"))?;
+        let codec = crate::log_window::stream_codec(&record.log_codecs, stream)?;
+        let path = if stream == "stdout" {
+            record.stdout_log
+        } else {
+            record.stderr_log
+        };
+        self.log_indexes
+            .lock()
+            .map_err(|_| anyhow!("log index lock poisoned"))?
+            .borrow(path, codec)?
+            .window(
+                action,
+                current,
+                count,
+                shift,
+                codec,
+                crate::log_window::RESPONSE_BYTES - 64,
+                generation,
+            )
+    }
+
+    pub fn log_raw_blocking(
+        &self,
+        shell_id: &str,
+        stream: &str,
+        reference: &crate::log_projection::RawReference,
+        offset: u64,
+        limit: usize,
+    ) -> Result<Vec<u8>> {
+        let record = self
+            .get_shell(shell_id)?
+            .ok_or_else(|| anyhow!("Shell not found: {shell_id}"))?;
+        let codec = crate::log_window::stream_codec(&record.log_codecs, stream)?;
+        let path = if stream == "stdout" {
+            record.stdout_log
+        } else {
+            record.stderr_log
+        };
+        self.log_indexes
+            .lock()
+            .map_err(|_| anyhow!("log index lock poisoned"))?
+            .borrow(path, codec)?
+            .raw(reference, offset, limit)
+    }
+
+    pub fn invalidate_log_index(&self, path: &std::path::Path) -> Result<()> {
+        self.log_indexes
+            .lock()
+            .map_err(|_| anyhow!("log index lock poisoned"))?
+            .invalidate(path)
+    }
+
     pub fn new() -> Self {
         Self::try_new().expect("failed to initialize native FWS store")
     }
@@ -611,6 +681,9 @@ impl FerrousNativeManager {
             store,
             native_env,
             parent_peer: Arc::new(Mutex::new(None)),
+            log_indexes: Arc::new(Mutex::new(
+                crate::log_window::IndexCache::new(32).expect("positive index capacity"),
+            )),
         };
         if start_parent_peer {
             manager.start_parent_peer_if_requested();
@@ -620,6 +693,7 @@ impl FerrousNativeManager {
 
     fn clone_without_parent_peer(&self) -> Self {
         Self {
+            log_indexes: Arc::clone(&self.log_indexes),
             state: Arc::clone(&self.state),
             subscriptions: Arc::clone(&self.subscriptions),
             subscriber_count: Arc::clone(&self.subscriber_count),
@@ -831,6 +905,7 @@ impl FerrousNativeManager {
             env_overrides: env.clone(),
             ui,
             debug,
+            log_codecs: spec.log_codecs.clone(),
             parent_shell_id: overrides.parent_shell_id,
         };
         let readiness = spec.readiness.clone();
@@ -1020,6 +1095,7 @@ impl FerrousNativeManager {
             autostart: true,
             ui: metadata.ui,
             debug: metadata.debug,
+            log_codecs: metadata.log_codecs,
             runtime_id: Some(self.store.runtime_id.clone()),
             app_id,
             parent_shell_id: metadata.parent_shell_id,
@@ -1156,6 +1232,7 @@ impl FerrousNativeManager {
             autostart: true,
             ui: metadata.ui,
             debug: metadata.debug,
+            log_codecs: metadata.log_codecs,
             runtime_id: Some(self.store.runtime_id.clone()),
             app_id,
             parent_shell_id: metadata.parent_shell_id,
@@ -1287,6 +1364,7 @@ impl FerrousNativeManager {
             autostart: true,
             ui: metadata.ui,
             debug: metadata.debug,
+            log_codecs: metadata.log_codecs,
             runtime_id: Some(self.store.runtime_id.clone()),
             app_id,
             parent_shell_id: metadata.parent_shell_id,
@@ -2738,6 +2816,7 @@ pub fn load_persisted_record(path: impl AsRef<Path>) -> Result<FerrousNativeShel
         autostart: persisted.autostart,
         ui: persisted.ui,
         debug: persisted.debug,
+        log_codecs: persisted.log_codecs,
         runtime_id: persisted.runtime_id,
         app_id,
         parent_shell_id: persisted.parent_shell_id,
@@ -3021,6 +3100,7 @@ fn persist_record(record: &FerrousNativeShellRecord, path: &std::path::Path) -> 
         autostart: record.autostart,
         ui: record.ui.clone(),
         debug: record.debug.clone(),
+        log_codecs: record.log_codecs.clone(),
         created_at_ms: record.created_at_ms,
         updated_at_ms: record.updated_at_ms,
         created_at: Some(ms_to_seconds(record.created_at_ms)),

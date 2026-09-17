@@ -18,6 +18,7 @@ pub struct RenderedShellSpec {
     pub subgroups: Vec<String>,
     pub ui: Map<String, Value>,
     pub debug: Map<String, Value>,
+    pub log_codecs: Map<String, Value>,
     pub pty_mode: String,
     pub autostart: bool,
     pub readiness: Option<RenderedReadinessProbe>,
@@ -109,7 +110,9 @@ pub fn parse_shellspec_entry(document: &Value, entry: &str) -> Result<RenderedSh
         .and_then(Value::as_bool)
         .unwrap_or(true);
     let readiness = parse_readiness_value(shell.get("readiness"), &id)?;
+    let log_codecs = crate::log_window::validate_log_codecs(shell.get("log_codecs"))?;
     Ok(RenderedShellSpec {
+        log_codecs,
         id,
         backend,
         command,

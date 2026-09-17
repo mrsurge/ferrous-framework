@@ -1,12 +1,12 @@
 //! Protocol-neutral projection primitives. Raw references always address source bytes.
-use anyhow::{Result, bail, ensure};
+use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub const RECORD_BYTES: usize = 8192;
 pub const PARSE_BYTES: usize = 1024 * 1024;
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Codec {
     Text,
@@ -116,7 +116,22 @@ pub fn project_record(
         "raw reference does not match record bytes"
     );
     if matches!(codec, Codec::Messagepack) {
-        bail!("MessagePack requires the frame decoder");
+        let frame = crate::msgpack_observation::decode_frame(data, parse_bytes.min(PARSE_BYTES))?
+            .ok_or_else(|| anyhow::anyhow!("expected one complete MessagePack frame"))?;
+        ensure!(
+            frame.consumed == data.len(),
+            "expected one complete MessagePack frame"
+        );
+        let normalized = serde_json::to_vec(&frame.value)?;
+        let temporary = RawReference {
+            generation: raw.generation.clone(),
+            byte_start: 0,
+            byte_end: normalized.len() as u64,
+        };
+        let mut projected =
+            project_record(&normalized, temporary, Codec::Json, max_bytes, parse_bytes)?;
+        projected.raw = raw;
+        return Ok(projected);
     }
     let text =
         String::from_utf8_lossy(&data[..data.len().min(max_bytes.saturating_add(4))]).into_owned();
@@ -166,6 +181,9 @@ pub fn project_record(
     items.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
     let mut omissions = Vec::new();
     for (size, pointer, original_type) in items {
+        if omissions.len() >= 128 || pointer.len() > 1024 {
+            return Ok(preview("structured_summary_required"));
+        }
         let (parent, escaped) = pointer.rsplit_once('/').expect("field pointer");
         let key = escaped.replace("~1", "/").replace("~0", "~");
         value
