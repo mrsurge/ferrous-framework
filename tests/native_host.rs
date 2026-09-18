@@ -532,6 +532,11 @@ fn native_child_manager_auto_peer_relays_lifecycle_and_logs_to_parent() {
 
     wait_for_shell_lifecycle_notification(&notifications, "fws.shell.spawned", &shell.id);
     open_shell_logs(&browser, &shell.id);
+    // The browser request acknowledges after broadcasting the desired remote
+    // subscription, while the child peer applies that broadcast asynchronously.
+    // Let the peer attach its output subscription before emitting the one-shot
+    // probe that this test expects to observe live.
+    thread::sleep(Duration::from_millis(200));
     child_manager
         .write_line_blocking(&shell.id, "probe")
         .expect("write auto-peer child pipe");
