@@ -301,7 +301,10 @@ The shared FWS dashboard keeps a sliding window of up to 200 source records.
 Scroll near an edge to fetch another slice while retaining overlap and your
 reading position. Scrolling away detaches live following; Jump to live restores
 the newest window. Existing events signal new output without polling or retaining
-hidden history. Tall previews scroll within bounded rows. Raw logs are unchanged;
+hidden history. Pane headers collapse their views, STDOUT opens first, and divider
+sizes/collapsed states persist per shell. STDIN is omitted when input is unsupported.
+Wrap is shared across streams and on by default. Records have subtle separators
+without individual height caps; byte-budget omissions still apply. Raw logs are unchanged;
 original bytes remain available through the raw API in pages of at most 64 KiB,
 not as dashboard hex controls.
 
