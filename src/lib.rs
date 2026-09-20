@@ -5,6 +5,7 @@ pub mod msgpack_observation;
 pub mod native_peer;
 pub mod native_runtime;
 pub mod peer_protocol;
+pub mod persistent_shell;
 pub mod shellspec;
 pub mod shutdown;
 

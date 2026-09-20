@@ -8,6 +8,7 @@ rust-version = "1.93"
 description = "Rust runtime path for framework-shells-compatible process management"
 
 [dependencies]
+fws-supervisor = { path = "crates/fws-supervisor", version = "0.1.0" }
 anyhow = "1"
 axum = "0.8"
 crossbeam-channel = "0.5"
