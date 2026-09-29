@@ -83,6 +83,16 @@ A manager-owned reactor handles passive proc stdout/stderr logging, pipe stderr 
 
 PTY launch supports `FerrousNativePtyMode::Raw` and `FerrousNativePtyMode::Interactive`. Raw mode applies raw termios to the PTY slave before spawning the child. Shellspec `pty_mode` is honored by native launch.
 
+PTY children start in a separate session with the slave as their controlling
+terminal. The kernel delivers terminal signals and resize notifications to that
+terminal's foreground process group, not the manager's group.
+PTY output is flushed to its raw log before chunk publication, including small
+prompts; pipe output retains its existing batching policy.
+`remove_exited_shell_blocking` removes only an owned, exited and reaped child,
+its metadata/log files and subscriptions, then publishes `fws.shell.removed`.
+Stop output readers before removal; use exact-root tree shutdown separately for
+a running child. Persisted records alone do not grant removal authority.
+
 ## Shellspecs
 
 A shellspec is a YAML launch file.

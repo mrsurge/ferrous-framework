@@ -27,6 +27,7 @@ use std::{
     io::{BufWriter, Error as IoError, ErrorKind, Read, Write},
     net::{TcpStream, ToSocketAddrs},
     os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
+    os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -139,6 +140,7 @@ pub enum FerrousNativeLifecycleEventKind {
     Spawned,
     Updated,
     Exited,
+    Removed,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -404,6 +406,7 @@ struct PersistedNativeShellRecord {
 }
 
 struct DirectOutput {
+    log_before_publish: bool,
     shell_id: String,
     stream: FerrousNativeOutputStream,
     reader: Box<dyn ReadAsFd>,
@@ -416,6 +419,7 @@ struct DirectOutput {
 }
 
 struct AsyncDirectOutput {
+    log_before_publish: bool,
     shell_id: String,
     stream: FerrousNativeOutputStream,
     reader: AsyncFd<OwnedFd>,
@@ -1186,6 +1190,7 @@ impl FerrousNativeManager {
             .ok_or_else(|| anyhow!("native pipe stdout missing"))?;
         set_nonblocking(&stdout)?;
         let output = Some(Arc::new(Mutex::new(DirectOutput {
+            log_before_publish: false,
             shell_id: id.clone(),
             stream: FerrousNativeOutputStream::Stdout,
             reader: Box::new(stdout),
@@ -1321,12 +1326,27 @@ impl FerrousNativeManager {
             .stdin(Stdio::from(File::from(slave_stdin)))
             .stdout(Stdio::from(File::from(slave_stdout)))
             .stderr(Stdio::from(File::from(slave_stderr)));
+        // Only async-signal-safe syscalls belong in the post-fork child. Give
+        // the terminal its own session and controlling tty before exec so job
+        // control, terminal-generated signals and resize target the child.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(IoError::last_os_error());
+                }
+                if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY, 0) == -1 {
+                    return Err(IoError::last_os_error());
+                }
+                Ok(())
+            });
+        }
         let child = command
             .spawn()
             .with_context(|| format!("failed to spawn native pty shell {id}"))?;
         let pid = child.id();
         let input = Some(boxed_writer(File::from(master_input)));
         let output = Some(Arc::new(Mutex::new(DirectOutput {
+            log_before_publish: true,
             shell_id: id.clone(),
             stream: FerrousNativeOutputStream::Stdout,
             reader: Box::new(master_output),
@@ -1527,6 +1547,70 @@ impl FerrousNativeManager {
         } else {
             bail!("native shell {shell_id} not found or not live")
         }
+    }
+
+    /// Forget an exited, locally owned shell and its files. Callers must stop
+    /// their output readers first. This deliberately never adopts or kills a
+    /// persisted PID; termination belongs to the explicit shutdown API.
+    pub fn remove_exited_shell_blocking(&self, shell_id: &str) -> Result<bool> {
+        let mut state = self.lock_state()?;
+        let Some(entry) = state.entries.get(shell_id) else {
+            return Ok(false);
+        };
+        if entry.record.status != FerrousNativeShellStatus::Exited {
+            bail!("refusing to remove running native shell {shell_id}");
+        }
+        if entry
+            .child
+            .lock()
+            .map_err(|_| anyhow!("native child lock poisoned"))?
+            .try_wait()?
+            .is_none()
+        {
+            bail!("refusing to remove unreaped native shell {shell_id}");
+        }
+        let record = entry.record.clone();
+        let mut paths = vec![
+            record.stdout_log.clone(),
+            record.stderr_log.clone(),
+            crate::log_window::reset_path(&record.stdout_log),
+            crate::log_window::reset_path(&record.stderr_log),
+        ];
+        if let Some(path) = &record.io_metadata_log {
+            paths.push(path.clone());
+        }
+        paths.push(record.record_path.clone());
+        for path in paths {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| format!("remove {}", path.display()));
+                }
+            }
+        }
+        state.entries.remove(shell_id);
+        self.async_outputs
+            .lock()
+            .map_err(|_| anyhow!("native async output lock poisoned"))?
+            .remove(shell_id);
+        let mut subscriptions = self
+            .subscriptions
+            .lock()
+            .map_err(|_| anyhow!("native subscriptions lock poisoned"))?;
+        let mut removed = 0;
+        subscriptions.subscribers.retain(|(id, _), entries| {
+            if id == shell_id {
+                removed += entries.len() as u64;
+                false
+            } else {
+                true
+            }
+        });
+        subscriptions.dropped.retain(|(id, _), _| id != shell_id);
+        decrement_subscriber_count(&self.subscriber_count, removed);
+        self.publish_lifecycle(FerrousNativeLifecycleEventKind::Removed, record);
+        Ok(true)
     }
 
     pub fn write_line_blocking(&self, shell_id: &str, line: &str) -> Result<bool> {
@@ -1960,8 +2044,8 @@ impl FerrousNativeManager {
         fallback: &FerrousNativeShellRecord,
         exit_code: Option<i32>,
     ) -> Result<()> {
+        let mut state = self.lock_state()?;
         let updated = {
-            let mut state = self.lock_state()?;
             if let Some(entry) = state.entries.get_mut(&fallback.id) {
                 entry.record.status = FerrousNativeShellStatus::Exited;
                 entry.record.exit_code = exit_code;
@@ -1975,6 +2059,11 @@ impl FerrousNativeManager {
         let updated = match updated {
             Some(record) => record,
             None => {
+                // A concurrent explicit removal wins over a shutdown snapshot.
+                // Retain the state lock through persistence and publication.
+                if !fallback.record_path.exists() {
+                    return Ok(());
+                }
                 let mut record = fallback.clone();
                 record.status = FerrousNativeShellStatus::Exited;
                 record.exit_code = exit_code;
@@ -2031,12 +2120,15 @@ impl FerrousNativeManager {
             (output, entry.record.stdout_log.clone())
         };
 
-        let owned_fd = {
+        let (owned_fd, log_before_publish) = {
             let mut output = output
                 .lock()
                 .map_err(|_| anyhow!("native output lock poisoned"))?;
             output.flush_log_if_due(true)?;
-            duplicate_raw_fd(output.reader.as_raw_fd())?
+            (
+                duplicate_raw_fd(output.reader.as_raw_fd())?,
+                output.log_before_publish,
+            )
         };
         set_nonblocking(&owned_fd)?;
         let reader = AsyncFd::new(owned_fd).context("failed to attach native stdout AsyncFd")?;
@@ -2046,6 +2138,7 @@ impl FerrousNativeManager {
             .open(&stdout_log)
             .with_context(|| format!("failed to open stdout log {}", stdout_log.display()))?;
         let output = Arc::new(AsyncDirectOutput {
+            log_before_publish,
             shell_id: shell_id.to_owned(),
             stream: FerrousNativeOutputStream::Stdout,
             reader,
@@ -2599,6 +2692,9 @@ impl DirectOutput {
         }
         self.flush_log_if_due(false)?;
         if !chunks.is_empty() {
+            if self.log_before_publish {
+                self.flush_log_if_due(true)?;
+            }
             broadcast_output_batch(
                 &self.subscriptions,
                 &self.subscriber_count,
@@ -2664,7 +2760,7 @@ impl AsyncDirectOutput {
             log.log.write_all(chunk)?;
             log.pending_flush_bytes += chunk.len();
         }
-        log.flush_if_due(false)
+        log.flush_if_due(self.log_before_publish)
     }
 }
 
@@ -3791,22 +3887,20 @@ fn check_reactor_children(
     }
     for (index, exit_code) in exited.into_iter().rev() {
         let child_entry = children.swap_remove(index);
-        let mut updated_record = None;
         if let Ok(mut state) = state.lock() {
             if let Some(entry) = state.entries.get_mut(&child_entry.shell_id) {
                 entry.record.status = FerrousNativeShellStatus::Exited;
                 entry.record.exit_code = Some(exit_code);
                 entry.record.updated_at_ms = now_ms();
                 let _ = persist_record(&entry.record, &entry.record_path);
-                updated_record = Some(entry.record.clone());
+                // Publish under the same lock as removal: an observer must
+                // never see a late Exited event resurrect a removed shell.
+                let _ = lifecycle_tx.send(FerrousNativeLifecycleEvent {
+                    shell_id: entry.record.id.clone(),
+                    kind: FerrousNativeLifecycleEventKind::Exited,
+                    shell: entry.record.clone(),
+                });
             }
-        }
-        if let Some(shell) = updated_record {
-            let _ = lifecycle_tx.send(FerrousNativeLifecycleEvent {
-                shell_id: shell.id.clone(),
-                kind: FerrousNativeLifecycleEventKind::Exited,
-                shell,
-            });
         }
     }
 }

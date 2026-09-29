@@ -500,11 +500,16 @@ fn lifecycle_notification(event: FerrousNativeLifecycleEvent) -> FwsJsonRpcNotif
         FerrousNativeLifecycleEventKind::Spawned => "fws.shell.spawned",
         FerrousNativeLifecycleEventKind::Updated => "fws.shell.updated",
         FerrousNativeLifecycleEventKind::Exited => "fws.shell.exited",
+        FerrousNativeLifecycleEventKind::Removed => "fws.shell.removed",
     };
     FwsJsonRpcNotification {
         jsonrpc: "2.0".to_owned(),
         method: method.to_owned(),
-        params: json!({ "shell": shell_payload_value(event.shell) }),
+        params: if event.kind == FerrousNativeLifecycleEventKind::Removed {
+            json!({ "shell_id": event.shell_id })
+        } else {
+            json!({ "shell": shell_payload_value(event.shell) })
+        },
     }
 }
 

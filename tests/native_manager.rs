@@ -1712,19 +1712,97 @@ fn pty_writes_stdin_and_reads_output_lines() {
 }
 
 #[test]
+fn pty_session_resize_and_owned_removal() {
+    let manager = test_manager_with_store("pty-session-removal");
+    let mut events = manager.subscribe_lifecycle();
+    let script = "import os,signal,time\nassert os.getsid(0)==os.getpid()\nassert os.tcgetpgrp(0)==os.getpid()\nresized=False\ndef on_resize(*_):\n global resized\n resized=True\nsignal.signal(signal.SIGWINCH,on_resize)\nprint('ready',flush=True)\nwhile not resized: time.sleep(.01)\nprint('size:%s:%s'%os.get_terminal_size(0),flush=True)\nwhile True: time.sleep(1)";
+    let record = manager
+        .spawn_pty_blocking(base_pty_config(
+            vec!["python3".into(), "-c".into(), script.into()],
+            test_log_dir("pty-session-removal-output"),
+        ))
+        .expect("spawn isolated controlling terminal");
+    assert_eq!(
+        manager
+            .read_line_blocking(&record.id, Duration::from_secs(5))
+            .unwrap(),
+        Some("ready".into())
+    );
+    assert!(
+        fs::read_to_string(&record.stdout_log)
+            .unwrap()
+            .contains("ready"),
+        "small PTY output must be log-visible before waking projection consumers"
+    );
+    let foreign = FerrousNativeManager::with_store_and_env(manager.store(), manager.native_env());
+    assert!(!foreign.remove_exited_shell_blocking(&record.id).unwrap());
+    assert!(manager.remove_exited_shell_blocking(&record.id).is_err());
+    assert!(manager.resize_pty_blocking(&record.id, 91, 37).unwrap());
+    assert_eq!(
+        manager
+            .read_line_blocking(&record.id, Duration::from_secs(5))
+            .unwrap(),
+        Some("size:91:37".into())
+    );
+    assert!(
+        fs::read_to_string(&record.stdout_log)
+            .unwrap()
+            .contains("size:91:37")
+    );
+    manager
+        .shutdown_tree_blocking(vec![i64::from(record.pid)])
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while manager.get_shell(&record.id).unwrap().unwrap().status != FerrousNativeShellStatus::Exited
+    {
+        assert!(Instant::now() < deadline, "child must exit before removal");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(manager.remove_exited_shell_blocking(&record.id).unwrap());
+    assert!(!manager.remove_exited_shell_blocking(&record.id).unwrap());
+    assert!(manager.get_shell(&record.id).unwrap().is_none());
+    assert!(manager.list_shells().unwrap().is_empty());
+    assert!(!record.record_path.exists());
+    assert!(!record.stdout_log.exists());
+    assert!(!record.stderr_log.exists());
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(
+        !record.record_path.exists(),
+        "reactor must not resurrect metadata"
+    );
+    let mut kinds = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        kinds.push(event.kind);
+    }
+    assert_eq!(
+        kinds.last(),
+        Some(&FerrousNativeLifecycleEventKind::Removed)
+    );
+}
+
+#[test]
 fn pty_raw_mode_applies_raw_slave_termios() {
     let manager = FerrousNativeManager::new();
     let log_dir = test_log_dir("pty-raw-mode");
     let mut config = base_pty_config(
-        vec!["sh".to_owned(), "-c".to_owned(), "stty -a".to_owned()],
+        vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "stty -a; printf '\\ntermios-complete\\n'".to_owned(),
+        ],
         log_dir,
     );
     config.mode = FerrousNativePtyMode::Raw;
     let record = manager.spawn_pty_blocking(config).expect("spawn raw pty");
     assert_eq!(record.pty_mode, Some(FerrousNativePtyMode::Raw));
-    let output = read_chunks_until_contains(&manager, &record.id, "icanon", Duration::from_secs(3))
-        .expect("read stty output")
-        .expect("stty output");
+    let output = read_chunks_until_contains(
+        &manager,
+        &record.id,
+        "termios-complete",
+        Duration::from_secs(3),
+    )
+    .expect("read stty output")
+    .expect("stty output");
     assert!(output.contains("-icanon"), "stty output: {output}");
     assert!(output.contains("-echo"), "stty output: {output}");
     let persisted: Value = serde_json::from_str(&eventually_read_to_string(

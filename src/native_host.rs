@@ -593,11 +593,16 @@ async fn emit_shell_lifecycle(io: &SocketIo, event: FerrousNativeLifecycleEvent)
         FerrousNativeLifecycleEventKind::Spawned => "fws.shell.spawned",
         FerrousNativeLifecycleEventKind::Updated => "fws.shell.updated",
         FerrousNativeLifecycleEventKind::Exited => "fws.shell.exited",
+        FerrousNativeLifecycleEventKind::Removed => "fws.shell.removed",
     };
     let notification = FwsJsonRpcNotification {
         jsonrpc: "2.0".to_owned(),
         method: method.to_owned(),
-        params: json!({ "shell": shell_payload(event.shell) }),
+        params: if event.kind == FerrousNativeLifecycleEventKind::Removed {
+            json!({ "shell_id": event.shell_id })
+        } else {
+            json!({ "shell": shell_payload(event.shell) })
+        },
     };
     let _ = ns
         .to(FWS_DASHBOARD_ROOM)
