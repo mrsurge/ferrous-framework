@@ -5,6 +5,32 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
+#[test]
+fn replay_client_is_accessible_without_a_separate_supervisor_dependency() {
+    use ferrous_framework::persistent_shell::{ReplayCursor, attachment, client::Client};
+    let cursor = ReplayCursor {
+        stdout: 4,
+        stderr: 2,
+    };
+    assert_eq!(
+        serde_json::to_value(cursor).unwrap(),
+        serde_json::json!({"stdout":4,"stderr":2})
+    );
+    // Constructing a future must not open a socket or require a runtime yet.
+    drop(Client::connect_from(
+        "/not-opened",
+        b"secret",
+        "instance",
+        cursor,
+    ));
+    drop(attachment::attach(
+        "/not-opened",
+        b"secret",
+        "fs_test",
+        None,
+    ));
+}
+
 #[derive(Deserialize)]
 struct SurvivalCase {
     value: Value,
